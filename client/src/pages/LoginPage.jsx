@@ -1,14 +1,12 @@
-import React, { useState, useContext  } from 'react';
+import React, { useState } from 'react';
 import { Mail, Lock, Eye, EyeOff, ArrowRight, Shield, Zap, Users, CheckCircle } from 'lucide-react';
 import PageLayout from '../components/PageLayout';
 import { useNavigate } from "react-router-dom";
-import { UserContext } from '../components/UserContext';// 👈 import UserContext
+const API_URL = import.meta.env.VITE_API_URL;
 
 const ModernLogin = () => {
 
     const navigate = useNavigate();
-      const { setUser } = useContext(UserContext); // 👈 get setUser from context
-
     const [formData, setFormData] = useState({
         email: "",
         password: ""
@@ -18,46 +16,13 @@ const ModernLogin = () => {
         setFormData({ ...formData, [e.target.name]: e.target.value });
     };
 
-    // const handleSubmit = async (e) => {
-    //     e.preventDefault();
-    //     console.log("Login submitted:", formData);
-
-    //     try {
-    //         const res = await fetch(`http://localhost:5000/api/auth/login`, {
-    //             method: "POST",
-    //             headers: { "Content-Type": "application/json" },
-    //             body: JSON.stringify(formData)
-    //         });
-
-    //         const data = await res.json().catch(err => {
-    //             console.error("JSON parse error:", err);
-    //             return {};
-    //         });
-
-    //         console.log("Response data:", data);
-    //         console.log("Status code:", res.status);
-
-    //         if (res.status === 200) {
-    //             if (data.token) {
-    //                 localStorage.setItem("token", data.token); // only set if token exists
-    //             }
-    //             alert("Login successful!");
-    //             navigate("/dashboard");
-    //         } else {
-    //             alert(data.message || "Login failed");
-    //         }
-
-    //     } catch (err) {
-    //         console.error("Error:", err);
-    //         alert("Something went wrong!");
-    //     }
-    // };
+   
     const handleSubmit = async (e) => {
         e.preventDefault();
         console.log("Login submitted:", formData);
 
         try {
-            const res = await fetch(`http://localhost:5000/api/auth/login`, {
+            const res = await fetch(`${API_URL}/login`, {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify(formData)
@@ -71,24 +36,26 @@ const ModernLogin = () => {
             console.log("Response data:", data);
             console.log("Status code:", res.status);
 
-             if (res.ok && data.token) {
-        // ✅ keep saving token for auth
-        localStorage.setItem("token", data.token);
+            if (res.ok && data.token) {
+                // Store token securely (localStorage for now)
+                localStorage.setItem("token", data.token);
 
-        if (data.user) {
-          // ✅ update context → Navbar updates instantly
-          setUser({
-            name: data.user.name || `${data.user.firstName} ${data.user.lastName}`,
-            email: data.user.email,
-            profileImage: data.user.profileImage
-            ? `http://localhost:5000/api/auth/profile-image/${data.user.id}?ts=${Date.now()}`
-            : ""
-          });
-        }
+                if (data.user) {
+                    localStorage.setItem("userName", data.user.name || "");
+                    localStorage.setItem("userEmail", data.user.email || "");
+                }
 
-        navigate("/dashboard"); // ✅ no need for window.location.reload()
-      } 
-            else {
+                // Optional: store user info
+                if (data.user) {
+                    if (data.token) {
+                        localStorage.setItem("token", data.token); // ✅ Save token here
+                    }
+                }
+
+                console.log("Token saved, redirecting to dashboard...");
+                navigate("/dashboard");
+                window.location.reload();
+            } else {
                 // Clear any old token to avoid using stale credentials
                 localStorage.removeItem("token");
                 alert(data.message || "Login failed");

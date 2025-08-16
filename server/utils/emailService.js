@@ -1,28 +1,21 @@
-// emailService.js
-import nodemailer from "nodemailer";
+import { Resend } from 'resend';
 
-let transporter;
+const resend = new Resend(process.env.RESEND_API_KEY);
 
-export const initEmail = async () => {
-  transporter = nodemailer.createTransport({
-    host: "smtp.gmail.com",
-    port: 465,
-    secure: true,
-    auth: {
-      user: process.env.GMAIL_USER,
-      pass: process.env.GMAIL_APP_PASSWORD
-    }
-  });
+export const sendEmail = async (to, subject, text) => {
+  try {
+    const data = await resend.emails.send({
+      from: 'onboarding@resend.dev',
+      to: 'xemail.test.2025@gmail.com',
+      subject: 'Your 2FA Code',
+      text,
+    });
+
+    console.log('Email sent:', data);
+  } catch (error) {
+    console.error('Error sending email:', error);
+    throw new Error('Email send failed');
+  }
 };
 
-export const sendEmail = async ({ to, subject,text }) => {
-  if (!transporter) throw new Error("Email transporter not initialized");
-  await transporter.sendMail({
-    from: `"Bounce Cure" <${process.env.GMAIL_USER}>`,
-    to,
-    subject,
-    text,
-  });
-};
-
-export default { initEmail, sendEmail };
+export default sendEmail;

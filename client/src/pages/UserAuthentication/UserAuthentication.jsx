@@ -26,7 +26,7 @@ const UserAuthentication = () => {
               <div className="p-3 bg-white/5 rounded-xl backdrop-blur-sm">
                 <Shield className="w-8 h-8 text-white" />
               </div>
-              <h1 className="text-4xl lg:text-5xl font-bold text-white">
+              <h1 className="text-4xl lg:text-5xl font-bold text-[#c2831f]">
                 Authentication & Security
               </h1>
             </div>
@@ -94,21 +94,22 @@ const UserAuthentication = () => {
               <TwoFactorAuth />
               <SecurityLogs />
               <ActiveSessions />
+              <div className="mt-16 text-center ">
+                <div className="inline-block bg-black/20 border border-white/5 rounded-xl p-6">
+                  <h3 className="text-lg font-semibold text-white mb-2">Need Help?</h3>
+                  <p className="text-gray-400 text-sm">
+                    If you're experiencing any issues with your account security, please contact our support team.
+                  </p>
+                  <button className="cursor-pointer mt-4 px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/10 hover:border-white/20 text-white rounded-lg transition-all duration-300">
+                    Contact Support
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
 
           {/* Footer Section */}
-          <div className="mt-16 text-center">
-            <div className="inline-block bg-black/20 border border-white/5 rounded-xl p-6">
-              <h3 className="text-lg font-semibold text-white mb-2">Need Help?</h3>
-              <p className="text-gray-400 text-sm">
-                If you're experiencing any issues with your account security, please contact our support team.
-              </p>
-              <button className="mt-4 px-4 py-2 bg-white/5 hover:bg-white/10 border border-white/10 hover:border-white/20 text-white rounded-lg transition-all duration-300">
-                Contact Support
-              </button>
-            </div>
-          </div>
+          
         </div>
       </div>
     </DashboardLayout>

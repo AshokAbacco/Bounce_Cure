@@ -39,7 +39,7 @@ router.post('/signup', signup);
 router.post('/login', login);
 
 router.post("/send-verification-email", protect, sendVerificationEmail);
-router.get("/verify-email", verifyEmail);
+router.get('/verify-email', verifyEmail);
 router.post("/send-otp", protect, sendOTP);
 router.post("/change-password", protect, changePassword);
 router.post("/2fa/enable", protect, enable2FA);

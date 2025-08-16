@@ -3,7 +3,7 @@ import jwt from "jsonwebtoken";
 import { PrismaClient } from "@prisma/client";
 
 import { prisma } from "../prisma/prismaClient.js";
-import { sendEmail } from "../utils/sendEmail.js";
+import sendEmail from '../utils/emailService.js';
 import { generateOTP } from "../utils/generateOTP.js";
 import { generateQRCode } from "../utils/generateQRCode.js";
 import speakeasy from 'speakeasy'; // for TOTP 2FA
@@ -157,7 +157,7 @@ export const getLoginLogs = async (req, res) => {
 export const sendVerificationEmail = async (req, res) => {
     const { email } = req.user;
     const token = jwt.sign({ email }, process.env.JWT_SECRET, { expiresIn: "15m" });
-    const link = `http://localhost:5000/verify-email?token=${token}`;
+    const link = `${process.env.BASE_URL}/verify-email?token=${token}`;
 
     await sendEmail(email, "Verify your email", `<a href="${link}">Verify Email</a>`);
     res.json({ message: "Verification email sent" });
@@ -179,20 +179,23 @@ export const verifyEmail = async (req, res) => {
 };
 
 // Send OTP
-export const sendOTP = async (req, res) => {
-    const { email } = req.user;
+export const sendOTP = async (user) => {
     const otp = Math.floor(100000 + Math.random() * 900000).toString();
 
-    await prisma.user.update({
-        where: { email },
-        data: { otp }
+    // Store OTP with expiry (preferable with a separate OTP model)
+    await prisma.oTPCode.create({
+        data: {
+            code: otp,
+            expiresAt: new Date(Date.now() + 10 * 60 * 1000), // 10 minutes
+            userId: user.id,
+        },
     });
 
-    await sendEmail(email, "Your OTP Code", `<h1>Your OTP is: ${otp}</h1>`);
-    res.json({ message: "OTP sent to email" });
+    await sendEmail(user.email, "Your OTP Code", `Your OTP is: ${otp}`);
+
+
+    return otp;
 };
-
-
 
 
 // Change password
@@ -228,53 +231,53 @@ export const changePassword = async (req, res) => {
     }
 };
 
-
-
 // Enable 2FA
 // authController.js
+
 export const enable2FA = async (req, res) => {
     try {
-        const user = await prisma.user.findUnique({ where: { id: req.user.id } });
-        if (!user) return res.status(404).json({ message: 'User not found' });
+        const userId = req.user.id;
 
-        // 1. Generate OTP
-        const otp = generateOTP();
+        const user = await prisma.user.findUnique({ where: { id: userId } });
+        if (!user) return res.status(404).json({ error: 'User not found' });
 
-        // 2. Save OTP and expiration in DB
-        await prisma.user.update({
-            where: { id: user.id },
-            data: {
-                twoFASecret: otp, // temporary secret for verification
-            },
-        });
+        // Call sendOTP with the user object to generate and send OTP
+        await sendOTP(user);
 
-        // 3. Generate QR code (optional)
-        const qrCodeDataURL = await generateQRCode(`YourApp:${user.email}?otp=${otp}`);
-
-        // 4. Return OTP & QR (frontend can display QR or send OTP via email)
-        res.json({ message: '2FA setup initiated', otp, qrCodeDataURL });
-    } catch (err) {
-        console.error(err);
-        res.status(500).json({ message: 'Internal server error' });
+        res.status(200).json({ success: true });
+    } catch (error) {
+        console.error('Enable 2FA error:', error);
+        res.status(500).json({ error: 'Server error' });
     }
 };
 
 export const verify2FA = async (req, res) => {
     try {
         const { otp } = req.body;
-        const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+        const userId = req.user.id;
 
+        const user = await prisma.user.findUnique({ where: { id: userId } });
         if (!user) return res.status(404).json({ message: 'User not found' });
-        if (user.twoFASecret !== otp) return res.status(400).json({ message: 'Invalid OTP' });
 
-        // OTP correct → enable 2FA
-        await prisma.user.update({
-            where: { id: user.id },
-            data: {
-                is2FAEnabled: true,
-                twoFASecret: null // clear temporary OTP
-            }
+        // Find the latest valid OTP for the user
+        const otpRecord = await prisma.oTPCode.findFirst({
+            where: {
+                userId,
+                code: otp,
+                expiresAt: { gt: new Date() },  // not expired
+            },
+            orderBy: { expiresAt: 'desc' }
         });
+
+        if (!otpRecord) return res.status(400).json({ message: 'Invalid or expired OTP' });
+
+        // Enable 2FA on user and delete the OTP record after successful verification
+        await prisma.user.update({
+            where: { id: userId },
+            data: { is2FAEnabled: true },
+        });
+
+        await prisma.oTPCode.deleteMany({ where: { userId } });
 
         res.json({ message: '2FA enabled successfully' });
     } catch (err) {
@@ -283,11 +286,8 @@ export const verify2FA = async (req, res) => {
     }
 };
 
-
-
 // Fixed backend version of getSecurityLogs
 export const getSecurityLogs = async (req, res) => {
-
     try {
         if (!req.user) {
             return res.status(401).json({ message: "Unauthorized" });
@@ -295,7 +295,8 @@ export const getSecurityLogs = async (req, res) => {
 
         const logs = await prisma.loginLog.findMany({
             where: { userId: req.user.id },
-            orderBy: { createdAt: "desc" }
+            orderBy: { createdAt: "desc" },
+            take: 5,  // <-- limits to 4 rows
         });
 
         res.status(200).json({ success: true, data: logs });
@@ -311,8 +312,9 @@ export const getActiveSessions = async (req, res) => {
         if (!req.user) return res.status(401).json({ message: "Unauthorized" });
 
         const sessions = await prisma.session.findMany({
-            where: { userId: req.user.id }, // ✅ use req.user
-            orderBy: { createdAt: "desc" }
+            where: { userId: req.user.id },
+            orderBy: { createdAt: "desc" },
+            take: 5,  // <-- limits to 4 rows
         });
 
         res.status(200).json({ success: true, data: sessions });
@@ -322,6 +324,22 @@ export const getActiveSessions = async (req, res) => {
     }
 };
 
+
+export const verifyAuth = (req, res, next) => {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader) return res.status(401).json({ error: 'No token provided' });
+
+    const token = authHeader.split(' ')[1];
+
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        req.user = decoded;
+        next();
+    } catch (err) {
+        return res.status(403).json({ error: 'Invalid token' });
+    }
+};
 
 export const testEmail = async (req, res) => {
     try {
@@ -340,18 +358,4 @@ export const testEmail = async (req, res) => {
 
 
 
-export const verifyAuth = (req, res, next) => {
-    const authHeader = req.headers.authorization;
 
-    if (!authHeader) return res.status(401).json({ error: 'No token provided' });
-
-    const token = authHeader.split(' ')[1];
-
-    try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET);
-        req.user = decoded;
-        next();
-    } catch (err) {
-        return res.status(403).json({ error: 'Invalid token' });
-    }
-};

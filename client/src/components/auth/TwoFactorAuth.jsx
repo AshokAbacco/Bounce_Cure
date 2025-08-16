@@ -14,7 +14,7 @@ const TwoFactorAuth = () => {
         try {
             const res = await authService.enable2FA();
             setQrCode(res.qrCodeDataURL);
-            alert(`OTP generated: ${res.otp}`);
+            alert("OTP has been sent to your registered email address. Please check your inbox.");
             setEnabled(true);
         } catch (err) {
             console.error(err);
