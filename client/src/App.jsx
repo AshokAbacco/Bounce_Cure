@@ -43,10 +43,14 @@ import { useNavigate } from "react-router-dom";
 import SendCampaign from './pages/Campaign/pages/SendCampaign';
 import AllTemplates from './pages/Campaign/pages/AllTemplats';
 import WatsupCampaign from './pages/WatsupCampaign';
+import SMSCampaign from './pages/SMSCampaign';
+
 
 import MultimediaCampaign from './pages/Multimedia/MultimediCampaign';
 import WhatsappCampaign from './pages/Multimedia/WhatsappCampaign';
 import SMScampaign from './pages/Multimedia/SMScampaign';
+import TermsConditions from './pages/Terms&conditions';
+import RefundPolicy from './pages/RefundPolicy';
 
 
 function App() {
@@ -114,6 +118,9 @@ function App() {
             <Route path="/all-templates" element={<AllTemplates />} />
             <Route path="/verify-email" element={<VerifyEmail />} />
             <Route path="/WatsupCampaign" element={<WatsupCampaign />} />
+            <Route path="/smscampaign" element={<SMSCampaign />} />
+            <Route path="/terms-and-conditions" element={<TermsConditions />} />
+            <Route path="/refund-policy" element={<RefundPolicy />} />
 
             <Route path="/MultimediaCampaign" element={<MultimediaCampaign />} />
             <Route path="/whatsapp" element={<WhatsappCampaign />} />

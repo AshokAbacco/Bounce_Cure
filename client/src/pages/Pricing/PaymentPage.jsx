@@ -1,8 +1,9 @@
 import React from "react";
-import { useLocation, Link } from "react-router-dom";
+import { useLocation, Link, useNavigate } from "react-router-dom";
 
 export default function PaymentPage() {
   const { state } = useLocation();
+  const navigate = useNavigate();
 
   const {
     name = "Pro Plan",
@@ -13,6 +14,12 @@ export default function PaymentPage() {
 
   const tax = (price * 0.1).toFixed(2); // 10% tax
   const total = (parseFloat(price) + parseFloat(tax)).toFixed(2);
+
+  // Handle pay button
+  const handlePay = () => {
+    // Here you can also check if checkbox is checked before navigation
+    navigate("/signin", { state: { from: "payment", plan: name, total } });
+  };
 
   return (
     <div className="min-h-screen bg-[#0f0f0f] text-white py-10 px-4 md:px-8 font-sans">
@@ -34,13 +41,16 @@ export default function PaymentPage() {
           </h2>
           <p className="text-gray-400 mb-5 text-sm">
             You're just a step away from unlocking{" "}
-            <span className="text-white font-semibold">{name}</span>. Enjoy premium features and priority access.
+            <span className="text-white font-semibold">{name}</span>. Enjoy
+            premium features and priority access.
           </p>
 
           <div className="space-y-4">
             {/* Card Number */}
             <div>
-              <label className="block text-sm mb-1 text-gray-300">Card Number</label>
+              <label className="block text-sm mb-1 text-gray-300">
+                Card Number
+              </label>
               <input
                 type="text"
                 className="w-full bg-[#111] border border-gray-700 text-white px-3 py-2 rounded"
@@ -51,7 +61,9 @@ export default function PaymentPage() {
             {/* Expiry & CVV */}
             <div className="flex flex-col sm:flex-row gap-4">
               <div className="flex-1">
-                <label className="block text-sm mb-1 text-gray-300">Expiry Date</label>
+                <label className="block text-sm mb-1 text-gray-300">
+                  Expiry Date
+                </label>
                 <input
                   type="text"
                   className="w-full bg-[#111] border border-gray-700 text-white px-3 py-2 rounded"
@@ -70,7 +82,9 @@ export default function PaymentPage() {
 
             {/* Payment Gateways */}
             <div className="mt-6">
-              <p className="text-sm font-medium text-gray-300 mb-2">Or pay with:</p>
+              <p className="text-sm font-medium text-gray-300 mb-2">
+                Or pay with:
+              </p>
               <div className="flex flex-col sm:flex-row gap-3">
                 {/* Razorpay */}
                 <button className="cursor-pointer flex-1 bg-[#ffffff0d] hover:bg-[#ffffff1a] border border-gray-600 py-2 rounded text-sm flex justify-center items-center transition-transform hover:scale-105">
@@ -112,7 +126,9 @@ export default function PaymentPage() {
         {/* Summary Section */}
         <div className="bg-[#1a1a1a] p-6 sm:p-8 rounded-xl shadow-lg border border-gray-800 flex flex-col justify-between">
           <div>
-            <h3 className="text-xl font-semibold text-[#d4af37] mb-4">Purchase Summary</h3>
+            <h3 className="text-xl font-semibold text-[#d4af37] mb-4">
+              Purchase Summary
+            </h3>
 
             <ul className="text-sm space-y-3">
               <li className="flex justify-between border-b border-gray-800 pb-2">
@@ -152,7 +168,10 @@ export default function PaymentPage() {
                 and <span className="underline text-white">Privacy Policy</span>.
               </label>
             </div>
-            <button className="w-full bg-[#d4af37] hover:bg-[#eac94d] text-black font-bold py-2 rounded transition cursor-pointer">
+            <button
+              onClick={handlePay}
+              className="w-full bg-[#d4af37] hover:bg-[#eac94d] text-black font-bold py-2 rounded transition cursor-pointer"
+            >
               Pay ${total}
             </button>
           </div>

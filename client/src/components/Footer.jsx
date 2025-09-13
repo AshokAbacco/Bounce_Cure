@@ -1,15 +1,20 @@
-import React, { useState } from 'react'
+import React, { useState } from "react";
 import { FaTwitter, FaFacebookF, FaLinkedinIn, FaGithub } from "react-icons/fa";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { GoHeartFill } from "react-icons/go";
-import SubFooter from './SubFooter';
 
 const Footer = () => {
   const [liked, setLiked] = useState(false);
+  const navigate = useNavigate();
+
+  // Scroll to top handler for selected links
+  const handleNavClick = (path) => {
+    navigate(path);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
 
   return (
     <div className="">
-      <SubFooter/>
       <footer className="relative bg-black text-white overflow-hidden ">
         {/* Complex Animated Wave Background */}
         <div className="absolute inset-0">
@@ -93,32 +98,26 @@ const Footer = () => {
         {/* Floating particles - Top only */}
         <div className="absolute inset-x-0 top-0 h-1/3 overflow-hidden">
           <div className="floating-particle absolute top-5 left-8 w-2 h-2 bg-white rounded-full opacity-40"></div>
-
           <div
             className="floating-particle absolute top-10 right-12 w-1.5 h-1.5 bg-white rounded-full opacity-60"
             style={{ animationDelay: "1.2s" }}
           ></div>
-
           <div
             className="floating-particle absolute top-6 left-1/4 w-1 h-1 bg-white rounded-full opacity-30"
             style={{ animationDelay: "2.5s" }}
           ></div>
-
           <div
             className="floating-particle absolute top-12 right-1/3 w-2 h-2 bg-white rounded-full opacity-50"
             style={{ animationDelay: "0.8s" }}
           ></div>
-
           <div
             className="floating-particle absolute top-4 left-1/2 w-1.5 h-1.5 bg-white rounded-full opacity-40"
             style={{ animationDelay: "1.8s" }}
           ></div>
-
           <div
             className="floating-particle absolute top-8 left-3/4 w-2 h-2 bg-white rounded-full opacity-35"
             style={{ animationDelay: "3s" }}
           ></div>
-
           <div
             className="floating-particle absolute top-14 right-1/5 w-1 h-1 bg-white rounded-full opacity-45"
             style={{ animationDelay: "2.2s" }}
@@ -136,7 +135,6 @@ const Footer = () => {
             style={{ animationDelay: "4s" }}
           ></div>
         </div>
-
 
         {/* Footer Content */}
         <div className="relative z-20 px-8 py-20">
@@ -167,25 +165,28 @@ const Footer = () => {
           </div>
 
           {/* Navigation */}
-          <nav className="flex flex-wrap justify-center gap-8 text-lg">
+          <nav className="flex flex-wrap justify-center gap-8 text-lg ">
             {[
               { label: "Home", path: "/" },
               { label: "About", path: "/about" },
               { label: "Integrations", path: "/services/integrations" },
               { label: "FAQ", path: "/faq" },
               { label: "Contact", path: "/contact" },
-            ].map(({ label, path }) => (
-              <a
+              { label: "Terms&Conditions", path: "/terms-and-conditions", scrollTop: true },
+              { label: "Refund Policy", path: "/refund-policy", scrollTop: true },
+            ].map(({ label, path, scrollTop }) => (
+              <button
                 key={label}
-                href={path}
-                className="relative group font-medium hover:text-gray-300 transition-all duration-300"
+                onClick={() =>
+                  scrollTop ? handleNavClick(path) : navigate(path)
+                }
+                className="relative group font-medium hover:text-gray-300 transition-all duration-300 cursor-pointer"
               >
                 {label}
                 <span className="absolute bottom-0 left-0 w-0 h-0.5 bg-white group-hover:w-full transition-all duration-300"></span>
-              </a>
+              </button>
             ))}
           </nav>
-
 
           {/* Divider */}
           <div className="w-full h-px bg-gradient-to-r from-transparent via-white/30 to-transparent mt-8"></div>

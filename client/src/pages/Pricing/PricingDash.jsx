@@ -68,7 +68,18 @@ export default function PricingDash() {
       price: priceFn(plan.price),
       contacts: contacts,
     };
-    navigate("/payment", { state: selectedPlan });
+
+    const isLoggedIn = !!localStorage.getItem("authToken"); // check if logged in
+
+    if (!isLoggedIn) {
+      // go to login first, then payment
+      navigate("/login", {
+        state: { redirectTo: "/payment", plan: selectedPlan },
+      });
+    } else {
+      // go directly to payment
+      navigate("/payment", { state: selectedPlan });
+    }
   };
 
   return (

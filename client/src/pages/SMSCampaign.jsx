@@ -11,7 +11,7 @@ import {
 import { RiTwitterXFill } from "react-icons/ri";
 import PageLayout from "../components/PageLayout";
 
-const WatsupCampaign = () => {
+const SmsCampaign = () => {
   const socialMediaCampaigns = [
     {
       id: 1,
@@ -148,12 +148,11 @@ const WatsupCampaign = () => {
                   100% { transform: translateX(-50%); }
                 }
 
-                /* Pop up and disappear cycle */
+                /* Pop up, disappear, repeat */
                 @keyframes popDisappear {
                   0% { transform: scale(0.5); opacity: 0; }
                   20% { transform: scale(1.2); opacity: 1; }
-                  50% { transform: scale(1); opacity: 0.8; }
-                  70% { transform: scale(1.1); opacity: 1; }
+                  50% { transform: scale(1); opacity: 0; }
                   100% { transform: scale(0.5); opacity: 0; }
                 }
 
@@ -188,4 +187,4 @@ const WatsupCampaign = () => {
   );
 };
 
-export default WatsupCampaign;
+export default SmsCampaign;
