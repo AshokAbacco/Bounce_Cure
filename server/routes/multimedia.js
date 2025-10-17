@@ -1,8 +1,6 @@
 import express from 'express';
 import { PrismaClient } from '@prisma/client';
 import { body, param, validationResult } from 'express-validator';
-import { sendMms, sendSms } from '../services/twilioService.js'; // import both functions
-
 const router = express.Router();
 const prisma = new PrismaClient();
 

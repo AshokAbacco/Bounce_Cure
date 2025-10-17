@@ -59,6 +59,12 @@ import contactRoutes from './routes/ContactUs.js';
 import userRoutes from './routes/user.js';
 import upiRoutes from "./routes/upi.js";
 import bodyParser from "body-parser";
+import multimediaCampaignRoutes from "./routes/multimediaCampaign.js";
+
+import twilioRoutes from "./routes/twilioConfig.js";
+import whatsappRoutes from "./routes/whatsappCampaign.js";
+import smsRoutes from "./routes/smsCampaign.js";
+
 // ENV setup
 import customRoutes from "./routes/customRoutes.js";
 import upiRoutes from './routes/upi.js'; 
@@ -185,8 +191,16 @@ app.use("/api/campaigncontacts", protect, campaignContactsRoutes);
 app.use("/api/campaigns", protect, campaignsRoutes);
 app.use("/api/verified-emails", protect, verifiedEmailsRouter);
 app.use('/api/analytics', protect, analyticsRouter);
-
 app.use('/api/contact', contactRoutes);
+
+app.use("/api/multimedia-campaign", multimediaCampaignRoutes);
+app.use("/api/twilio", twilioRoutes);
+app.use("/api/whatsapp", whatsappRoutes);
+app.use("/api/sms", smsRoutes);
+
+
+
+app.get("/", (req, res) => res.send("Twilio SMS/WhatsApp API Running"));
 
 app.use("/api/custom", customRoutes);
 

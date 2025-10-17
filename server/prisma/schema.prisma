@@ -54,6 +54,11 @@ model User {
   ScheduledCampaign   ScheduledCampaign[]
   BatchResult         BatchResult[]
   CustomRecord        CustomRecord[]
+
+  // 🔹 NEW RELATIONS for Twilio Integration
+  twilioConfig      TwilioConfig?
+  whatsappCampaigns WhatsappCampaign[]
+  smsCampaigns      SmsCampaign[]
 }
 
 model Content {
@@ -592,4 +597,65 @@ model CustomRecord {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@map("custom_records")
+}
+
+model TwilioConfig {
+  id               Int      @id @default(autoincrement())
+  userId           Int      @unique // one config per user
+  accountSid       String
+  authToken        String
+  whatsappNumber   String?
+  smsNumber        String?
+  messagingService String? // optional: for Twilio Messaging Service SID
+  isActive         Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  // Relation to User
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model WhatsappCampaign {
+  id         Int                 @id @default(autoincrement())
+  userId     Int
+  name       String
+  message    String
+  mediaUrl   String?
+  schedule   DateTime? // for scheduled send
+  createdAt  DateTime            @default(now())
+  updatedAt  DateTime            @updatedAt
+  status     String              @default("queued") // queued | sent | failed
+  recipients WhatsappRecipient[]
+  user       User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model WhatsappRecipient {
+  id                 Int              @id @default(autoincrement())
+  phone              String
+  status             String? // sent | delivered | failed
+  error              String?
+  whatsappCampaignId Int
+  campaign           WhatsappCampaign @relation(fields: [whatsappCampaignId], references: [id], onDelete: Cascade)
+}
+
+model SmsCampaign {
+  id         Int            @id @default(autoincrement())
+  userId     Int
+  name       String
+  message    String
+  schedule   DateTime?
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+  status     String         @default("queued")
+  recipients SmsRecipient[]
+  user       User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model SmsRecipient {
+  id            Int         @id @default(autoincrement())
+  phone         String
+  status        String?
+  error         String?
+  smsCampaignId Int
+  campaign      SmsCampaign @relation(fields: [smsCampaignId], references: [id], onDelete: Cascade)
 }

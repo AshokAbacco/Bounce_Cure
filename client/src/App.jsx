@@ -65,6 +65,7 @@ import PrivacyPolicy from './pages/PrivacyPolicy';
 
 import OAuthOutlookCallback from './components/inbox/OAuthOutlookCallback';
 import ScrollToTop from './components/ScrollToTop';
+import TwilioSetupPage from './pages/Multimedia/TwilioSetupPage';
 
 function App() {
   return (
@@ -157,6 +158,7 @@ function App() {
             <Route path="/texteditor" element={<ProtectedRoute><CampaignTextEditor /></ProtectedRoute>} />
 
             <Route path="/oauth/outlook/callback" element={<OAuthOutlookCallback />} />
+            <Route path="/twilio-setup" element={<TwilioSetupPage />} />
 
           
             
