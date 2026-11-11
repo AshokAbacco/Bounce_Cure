@@ -3,6 +3,57 @@ import express from "express";
 import sgMail from "@sendgrid/mail";
 import { prisma } from "../prisma/prismaClient.js";
 import { protect } from "../middleware/authMiddleware.js";
+import {
+  sendCampaignMessage,
+  resolveSendMethod,
+  getSmtpSettings,
+  getSmtpUsage,
+  getSendMethodsFor,
+} from "../services/campaignTransport.js";
+
+// ================================================================
+// 📮 DEDICATED SENDGRID CLIENT FOR CAMPAIGNS
+// ----------------------------------------------------------------
+// The default `sgMail` export is ONE shared object for the whole app.
+// Other files (mailer.js, services/emailService.js, imapSync.js…) call
+// sgMail.setApiKey() with DIFFERENT keys, so whichever ran last decided
+// which SendGrid account a campaign was sent from. With a dedicated IP,
+// sending from an account/subuser that has no IP assigned gives:
+//   deferred: "no IPs are available for this account"
+// This private client always uses the campaign key, nothing can swap it.
+//
+// Env vars:
+//   SENDGRID_CAMPAIGN_API_KEY  (optional) key from the account that owns
+//                              the dedicated IP. Falls back to SENDGRID_API_KEY.
+//   SENDGRID_IP_POOL           (optional) IP pool name. Only set this if the
+//                              pool exists in SendGrid AND contains your IP.
+// ================================================================
+const campaignMailer = new sgMail.MailService();
+let campaignMailerKey = null;
+
+function getCampaignApiKey() {
+  return process.env.SENDGRID_CAMPAIGN_API_KEY || process.env.SENDGRID_API_KEY || null;
+}
+
+function initCampaignMailer() {
+  const key = getCampaignApiKey();
+  if (!key) return false;
+  if (key !== campaignMailerKey) {
+    campaignMailer.setApiKey(key);
+    campaignMailerKey = key;
+    // Log only the public key ID (middle part) so you can match it in
+    // SendGrid → Settings → API Keys. Never log the full key.
+    const keyId = key.split(".")[1] || "unknown";
+    console.log(`📮 Campaign SendGrid key ID: ${keyId}${process.env.SENDGRID_IP_POOL ? ` | IP pool: ${process.env.SENDGRID_IP_POOL}` : ""}`);
+  }
+  return true;
+}
+
+async function sendCampaignMail(msg) {
+  if (!initCampaignMailer()) throw new Error("SendGrid campaign API key not configured");
+  const pool = process.env.SENDGRID_IP_POOL;
+  return campaignMailer.send(pool ? { ...msg, ipPoolName: pool } : msg);
+}
 
 const router = express.Router();
 router.use(protect);
@@ -31,8 +82,12 @@ export async function resumeStuckCampaigns() {
 }
 
 async function _sendInBatches(campaign, buildMessage) {
-  if (!process.env.SENDGRID_API_KEY) return;
-  sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+  const sendMethod = campaign.sendMethod || "SENDGRID";
+  if (sendMethod === "SENDGRID" && !initCampaignMailer()) {
+    console.error(`❌ Campaign ${campaign.id}: SendGrid campaign API key not configured`);
+    return { stopped: true, reason: "SendGrid campaign API key not configured" };
+  }
+  let stopReason = null; // set when the provider says "stop" (SMTP quota / login failure)
 
   let recipients = [];
   try { recipients = JSON.parse(campaign.recipientsJson || "[]"); } catch { return; }
@@ -44,7 +99,7 @@ async function _sendInBatches(campaign, buildMessage) {
   const startBatch = Math.max(1, campaign.currentBatch || 1);
   let   totalSent  = campaign.sentCount || 0;
 
-  console.log(`🚀 Campaign ${campaign.id} | ${totalRecipients} recipients | ${totalBatches} batches | Starting at batch ${startBatch}`);
+  console.log(`🚀 Campaign ${campaign.id} | via ${sendMethod} | ${totalRecipients} recipients | ${totalBatches} batches | Starting at batch ${startBatch}`);
 
   // ── Initialize batch metadata in DB ───────────────────────────
   await prisma.campaign.update({
@@ -66,8 +121,9 @@ async function _sendInBatches(campaign, buildMessage) {
     // ✅ Spread batchCount emails evenly over 30 minutes
     // 2000 emails → 900ms delay each = exactly 30 min
     //  500 emails → 3600ms delay each = exactly 30 min
-    const delayPerEmail = Math.floor(BATCH_DURATION_MS / batchCount);
-
+const delayPerEmail = batchCount < 50 
+  ? 2000  // small batch: 2s max delay
+  : Math.floor(BATCH_DURATION_MS / batchCount);
     console.log(`\n📦 Batch ${batchNum}/${totalBatches} | emails ${batchStart + 1}–${batchEnd} | delay: ${delayPerEmail}ms/email`);
 
     // Update currentBatch so Analytics shows live progress
@@ -101,7 +157,7 @@ async function _sendInBatches(campaign, buildMessage) {
           };
 
       try {
-        const response = await sgMail.send(msg);
+        const response = await sendCampaignMessage(sendMethod, msg, sendCampaignMail);
         if (response[0].statusCode >= 200 && response[0].statusCode < 300) {
           batchSent++;
           totalSent++;
@@ -110,20 +166,27 @@ async function _sendInBatches(campaign, buildMessage) {
           console.error(`⚠️  Status ${response[0].statusCode} for ${toEmail}`);
         }
       } catch (e) {
+        if (e.stopCampaign) {
+          // Quota / login problem: every remaining email would fail the same way. Stop here.
+          stopReason = e.message;
+          console.error(`⛔ Campaign ${campaign.id} stopped (${sendMethod}): ${e.message}`);
+          break;
+        }
         batchFailed++;
         console.error(`❌ ${toEmail}:`, e.response?.body?.errors?.[0]?.message || e.message);
       }
 
       // ✅ Save progress + update pending every 50 emails
-      if ((i + 1) % 50 === 0) {
+      // ✅ Fix — also save when it's the last email in a small batch
+      const isLastEmail = i === batchEmails.length - 1;
+      if ((i + 1) % 50 === 0 || isLastEmail) {
         await prisma.campaign.update({
           where: { id: campaign.id },
           data: {
             sentCount: totalSent,
-            pending:   totalRecipients - totalSent,  // ✅ keep pending in sync
+            pending:   totalRecipients - totalSent,
           },
         });
-        console.log(`   💾 batch ${batchNum} | ${i + 1}/${batchCount} | totalSent: ${totalSent} | pending: ${totalRecipients - totalSent}`);
       }
 
       // ✅ THE CRITICAL THROTTLE — spaces emails over 30 minutes
@@ -140,6 +203,24 @@ async function _sendInBatches(campaign, buildMessage) {
     });
 
     console.log(`✅ Batch ${batchNum}/${totalBatches} done | sent: ${batchSent} | failed: ${batchFailed} | totalSent: ${totalSent}`);
+
+    if (stopReason) {
+      await prisma.campaign.update({
+        where: { id: campaign.id },
+        data:  { sentCount: totalSent, pending: totalRecipients - totalSent, status: "paused" },
+      });
+      await prisma.automationLog.create({
+        data: {
+          userId:       campaign.userId,
+          campaignId:   campaign.id,
+          campaignName: campaign.name || campaign.subject,
+          status:       "paused",
+          message:      `Stopped after ${totalSent}/${totalRecipients} emails via ${sendMethod}`,
+          error:        stopReason,
+        },
+      }).catch(() => {});
+      return { stopped: true, reason: stopReason, sent: totalSent };
+    }
 
     // 5s pause between batches
     if (batchNum < totalBatches) {
@@ -160,9 +241,11 @@ async function _sendInBatches(campaign, buildMessage) {
   });
 
   console.log(`🎉 Campaign ${campaign.id} COMPLETE | ${totalSent}/${totalRecipients} sent across ${totalBatches} batch(es)`);
+  return { stopped: false, sent: totalSent };
 }
-const generateHtmlFromCanvas = (canvasData, subject, fromName, fromEmail, fromAddress, replyToEmail, bgColorOverride) => {
+// In server/routes/campaigns.js, replace the entire generateHtmlFromCanvas function with this updated version
 
+function generateHtmlFromCanvas(canvasData, subject, fromName, fromEmail, fromAddress, replyToEmail, bgColorOverride) {
   /* ── EMPTY FALLBACK ─────────────────────────────────────────── */
   if (!canvasData || canvasData.length === 0) {
     return `<!DOCTYPE html><html><head><meta charset="UTF-8"/><title>${subject}</title></head>
@@ -177,10 +260,8 @@ Sent by <strong>${fromName}</strong> | ${fromAddress} | <a href="mailto:${fromEm
   }
 
   /* ── DIMENSIONS ─────────────────────────────────────────────── */
-  /* The canvas editor uses 800px width.                           */
-  /* The email content area is 560px (600px − 40px padding).      */
   const CW = 800;   // canvas width
-  const EW = 560;   // email content width
+  const EW = 660;   // email content width (700px table - 20px padding each side)
 
   // Scale a canvas pixel value to an email pixel value
   const sc = (v) => Math.round((Number(v) || 0) * EW / CW);
@@ -201,109 +282,277 @@ Sent by <strong>${fromName}</strong> | ${fromAddress} | <a href="mailto:${fromEm
     }));
 
   /* ── ALIGNMENT INFERENCE ────────────────────────────────────── */
-  // Uses ratio of element center to canvas width (not hardcoded px).
-  // When inside a card (inCard=true), ALWAYS trust the element's textAlign
-  // because card children are positioned relative to the card, not the canvas,
-  // so position-based detection wrongly centers left-aligned card text.
-function align(el, inCard, forceLeft) {
-  // 1️⃣ Inside a card: always trust the stored textAlign directly.
-  if (inCard) return el.textAlign || 'left';
-
-  // 2️⃣ forceLeft: companion column beside an image — skip position-based
-  //    detection, but still respect whatever the user explicitly set.
-  if (forceLeft) {
+  function align(el, inCard, forceLeft, card) {
+    if (inCard) {
+      if (el.textAlign === 'left' || el.textAlign === 'center' || el.textAlign === 'right')
+        return el.textAlign;
+      // No explicit alignment: derive it from where the element sits inside
+      // the card, not inside the whole canvas.
+      if (card && card.width > 0) {
+        const r = ((el.x + el.width / 2) - card.x) / card.width;
+        if (r < 0.32) return 'left';
+        if (r > 0.68) return 'right';
+        return 'center';
+      }
+      return 'left';
+    }
+    if (forceLeft) {
+      if (el.textAlign === 'left' || el.textAlign === 'center' || el.textAlign === 'right')
+        return el.textAlign;
+      return 'left';
+    }
     if (el.textAlign === 'left' || el.textAlign === 'center' || el.textAlign === 'right')
       return el.textAlign;
-    return 'left'; // default for companion columns with no explicit alignment
+    const ratio = (el.x + el.width / 2) / CW;
+    if (ratio < 0.30) return 'left';
+    if (ratio > 0.70) return 'right';
+    return 'center';
   }
 
-  // 3️⃣ Trust explicit alignment set in the editor.
-  if (el.textAlign === 'left' || el.textAlign === 'center' || el.textAlign === 'right')
-    return el.textAlign;
-
-  // 4️⃣ Fall back to position-based detection (only when textAlign is not set).
-  const ratio = (el.x + el.width / 2) / CW;
-  if (ratio < 0.30) return 'left';
-  if (ratio > 0.70) return 'right';
-  return 'center';
-}
+  /* ── POSITIONAL WRAPPER ─────────────────────────────────────────
+     Reproduces the element's canvas X offset using spacer cells.
+     Email clients drop `position:absolute`, but table cell widths are
+     universally supported, so this is the faithful equivalent.        */
+  function positionRow(x, width, innerHtml) {
+    const leftPx  = Math.max(0, Math.min(sc(x), EW - 1));
+    const bodyPx  = Math.max(1, Math.min(sc(width), EW - leftPx));
+    const rightPx = Math.max(0, EW - leftPx - bodyPx);
+    const spacer  = (w) => w > 0
+      ? `<td class="bc-gutter" width="${w}" style="width:${w}px;font-size:0;line-height:0;">&nbsp;</td>`
+      : '';
+    return `<table class="bc-row" width="100%" cellpadding="0" cellspacing="0" border="0" style="table-layout:fixed;width:100%;">`
+      + `<tr>${spacer(leftPx)}`
+      + `<td class="bc-cell" width="${bodyPx}" valign="top" style="width:${bodyPx}px;">${innerHtml}</td>`
+      + `${spacer(rightPx)}</tr></table>`;
+  }
 
   /* ── ELEMENT RENDERERS ──────────────────────────────────────── */
-  // Convert \n to <br/> so multi-line canvas text renders correctly in email clients
-  const nl2br = (str) => (str || '').replace(/\n/g, '<br/>');
 
-  function renderEl(el, inCard, forceLeft, colWidthPx) {
-    const a = align(el, inCard, forceLeft);
+  /* Inline markup allowlist — mirrors client/.../Editor/richText.js.
+     Anything outside <b|strong|i|em|u|s|a|br> is escaped, so pasted or
+     tampered content can never inject markup into the email. */
+  const INLINE_OK = /^(b|strong|i|em|u|s|br)$/i;
+  const LIST_OK   = /^(ul|ol|li)$/i;
+
+  /* Email clients zero out list margins/padding, so state them explicitly.
+     `type` is kept alongside list-style-type because Outlook's Word engine
+     honours the attribute but ignores the CSS. */
+  const listOpenTag = (tag, attrs) => {
+    if (/^ul$/i.test(tag)) return '<ul style="margin:6px 0;padding-left:26px;list-style-type:disc;">';
+    if (/^li$/i.test(tag)) return '<li style="margin:3px 0;">';
+    const m = /type\s*=\s*["']?([1IiAa])["']?/.exec(attrs || '');
+    const roman = m && /^i$/i.test(m[1]);
+    return `<ol type="${roman ? 'I' : '1'}" style="margin:6px 0;padding-left:26px;list-style-type:${roman ? 'upper-roman' : 'decimal'};">`;
+  };
+
+  const escapeHtml = (str) => String(str ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  const safeHref = (raw) => {
+    const href = String(raw || '').trim();
+    if (/^(https?:|mailto:|tel:)/i.test(href)) return href;
+    if (/^[\w-]+(\.[\w-]+)+([/?#].*)?$/.test(href)) return `https://${href}`;
+    return null;
+  };
+
+  function inlineHtml(str, linkColor) {
+    if (!str) return '';
+    // Drop <script>/<style> blocks including their contents
+    const cleaned = String(str).replace(/<(script|style)\b[\s\S]*?<\/\1\s*>/gi, '');
+
+    let out = '';
+    let last = 0;
+    const linkStack = [];   // tracks whether each open <a> was emitted
+    const listStack = [];   // tracks open ul/ol/li so closes always match
+    const re = /<\/?([a-zA-Z][\w-]*)((?:[^>"']|"[^"]*"|'[^']*')*)>/g;
+    let m;
+    while ((m = re.exec(cleaned)) !== null) {
+      out += escapeHtml(cleaned.slice(last, m.index));
+      last = re.lastIndex;
+      const [full, tag, attrs] = m;
+      const closing = full.startsWith('</');
+      const t = tag.toLowerCase();
+
+      if (INLINE_OK.test(t)) {
+        out += closing ? `</${t}>` : `<${t}>`;
+      } else if (LIST_OK.test(t)) {
+        if (closing) {
+          if (listStack.length && listStack[listStack.length - 1] === t) { listStack.pop(); out += `</${t}>`; }
+        } else {
+          listStack.push(t);
+          out += listOpenTag(t, attrs);
+        }
+      } else if (t === 'a') {
+        if (closing) {
+          // Only close a link we actually opened — never leak a stray </a>
+          if (linkStack.pop()) out += '</a>';
+          continue;
+        }
+        const hrefMatch = /href\s*=\s*("([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(attrs || '');
+        const href = safeHref(hrefMatch ? (hrefMatch[2] ?? hrefMatch[3] ?? hrefMatch[4]) : '');
+        linkStack.push(!!href);
+        if (href) {
+          out += `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer" style="color:${linkColor || '#1155cc'};text-decoration:underline;">`;
+        }
+        // unsafe href: tag dropped, inner text still rendered
+      }
+      // any other tag: dropped entirely
+    }
+    out += escapeHtml(cleaned.slice(last));
+    while (linkStack.length) { if (linkStack.pop()) out += '</a>'; }  // close anything left open
+    while (listStack.length) { out += `</${listStack.pop()}>`; }
+    return out
+      .replace(/>\s*\r?\n\s*</g, '><')        // newlines between list tags are not <br/>
+      .replace(/\r?\n/g, '<br/>');
+  }
+
+  const nl2br = (str) => inlineHtml(str);
+
+  /* letter-spacing / text-transform come from the Campaign Text Editor.
+     Emitted only when present so untouched templates are unchanged. */
+  const extraType = (el) => {
+    let css = '';
+    if (el.letterSpacing && el.letterSpacing !== '0px') css += `letter-spacing:${el.letterSpacing};`;
+    if (el.textTransform && el.textTransform !== 'none') css += `text-transform:${el.textTransform};`;
+    return css;
+  };
+
+  function renderEl(el, inCard, forceLeft, colWidthPx, card) {
+    const a = align(el, inCard, forceLeft, card);
 
     switch (el.type) {
 
       case 'heading':
-        return `<h1 style="margin:4px 0;font-size:${el.fontSize || 28}px;color:${el.color || '#333'};font-weight:${el.fontWeight || '700'};font-family:${el.fontFamily || 'Arial,sans-serif'};text-align:${a};line-height:1.3;background:${el.backgroundColor || 'transparent'};">${nl2br(el.content) || 'Heading'}</h1>`;
+        return `<h1 style="margin:2px 0;font-size:${el.fontSize || 28}px;color:${el.color || '#333'};font-weight:${el.fontWeight || '700'};font-family:${el.fontFamily || 'Arial,sans-serif'};text-align:${a};line-height:1.3;background:${el.backgroundColor || 'transparent'};${extraType(el)}">${nl2br(el.content) || 'Heading'}</h1>`;
 
       case 'subheading':
-        return `<h2 style="margin:4px 0;font-size:${el.fontSize || 20}px;color:${el.color || '#333'};font-weight:${el.fontWeight || '600'};font-family:${el.fontFamily || 'Arial,sans-serif'};text-align:${a};background:${el.backgroundColor || 'transparent'};">${nl2br(el.content) || 'Subheading'}</h2>`;
+        return `<h2 style="margin:2px 0;font-size:${el.fontSize || 20}px;color:${el.color || '#333'};font-weight:${el.fontWeight || '600'};font-family:${el.fontFamily || 'Arial,sans-serif'};text-align:${a};background:${el.backgroundColor || 'transparent'};${extraType(el)}">${nl2br(el.content) || 'Subheading'}</h2>`;
 
-      case 'paragraph':
-        return `<p style="margin:5px 0;font-size:${el.fontSize || 15}px;color:${el.color || '#333'};font-family:${el.fontFamily || 'Arial,sans-serif'};font-weight:${el.fontWeight || 'normal'};font-style:${el.fontStyle || 'normal'};text-decoration:${el.textDecoration || 'none'};line-height:${el.lineHeight || 1.6};text-align:${a};word-break:break-word;background:${el.backgroundColor || 'transparent'};">${nl2br(el.content) || ''}</p>`;
+      case 'paragraph': {
+        const tag = /<(ul|ol)\b/i.test(el.content || '') ? 'div' : 'p';
+        return `<${tag} style="margin:3px 0;font-size:${el.fontSize || 15}px;color:${el.color || '#333'};font-family:${el.fontFamily || 'Arial,sans-serif'};font-weight:${el.fontWeight || 'normal'};font-style:${el.fontStyle || 'normal'};text-decoration:${el.textDecoration || 'none'};line-height:${el.lineHeight || 1.3};text-align:${a};word-break:break-word;background:${el.backgroundColor || 'transparent'};${extraType(el)}">${nl2br(el.content) || ''}</${tag}>`;
+      }
 
-      case 'blockquote':
-        return `<div style="margin:8px 0;font-size:${el.fontSize || 15}px;color:${el.color || '#E8D8A0'};font-family:${el.fontFamily || 'Georgia,serif'};font-style:italic;border-left:4px solid ${el.borderColor || el.strokeColor || '#C9A84C'};padding:4px 0 4px 12px;text-align:${a};">${nl2br(el.content) || ''}</div>`;
+      case 'blockquote': {
+        // The left rule used to be hardcoded, so quotes gained a bar in the
+        // email that isn't on the canvas. Now it only appears if the element
+        // actually has a border set in the properties panel.
+        const qbw = Number(el.borderWidth) || 0;
+        const qRule = qbw > 0
+          ? `border-left:${qbw}px ${el.borderStyle && el.borderStyle !== 'none' ? el.borderStyle : 'solid'} ${el.borderColor || el.strokeColor || '#C9A84C'};padding:4px 0 4px 12px;`
+          : '';
+        return `<div style="margin:3px 0;font-size:${el.fontSize || 15}px;color:${el.color || '#E8D8A0'};font-family:${el.fontFamily || 'Georgia,serif'};font-style:italic;${qRule}text-align:${a};">${nl2br(el.content) || ''}</div>`;
+      }
 
       case 'image': {
         let src = el.src || '';
         if (!src || src.startsWith('blob:') || src.startsWith('data:')) src = 'https://via.placeholder.com/560x200?text=No+Image';
         if (!src.startsWith('http://') && !src.startsWith('https://')) src = `${process.env.API_BASE_URL}${src}`;
-        const br = Number(el.borderRadius) || 0;
-        const bdr = el.borderWidth ? `border:${el.borderWidth}px solid ${el.borderColor || '#ccc'};` : '';
-        // inCard or forceLeft = image is inside a side-by-side column cell → fill column width
-        // Wide standalone (>= 55% canvas width) → full email width
-        // Small standalone → scale proportionally based on canvas size
-        const isWide = inCard || forceLeft || (Number(el.width) || 0) / CW >= 0.55;
-        const maxW = isWide ? '100%' : `${sc(el.width)}px`;
-        // Preserve exact canvas height in side-by-side column.
-        // colWidthPx = actual pixel width of this column in the email (passed from multi-col renderer)
-        // Scale height = canvas_height * (colWidthPx / canvas_el_width)
-        const elH = Number(el.height) || 0;
+        // A radius may be a percentage ("50%" for a circle). Number() turns
+        // that into NaN, so the old code silently dropped it and every rounded
+        // image came out square.
+        const rawR = el.borderRadius;
+        const radiusCss = typeof rawR === 'string' && rawR.trim().endsWith('%')
+          ? rawR.trim()
+          : `${Number(rawR) || 0}px`;
+
+        const bdr = Number(el.borderWidth) > 0
+          ? `border:${el.borderWidth}px ${el.borderStyle && el.borderStyle !== 'none' ? el.borderStyle : 'solid'} ${el.borderColor || '#ccc'};`
+          : '';
+
         const elW = Number(el.width) || 1;
+        const elH = Number(el.height) || 0;
+
+        // Space this image actually has to fill. Inside a card that's the
+        // card's own width minus its 16px padding, not a guess off EW.
+        const availPx = colWidthPx
+          || (card && card.width ? Math.max(1, sc(card.width) - 32) : EW);
+        const naturalPx = sc(elW);
+        // Only stretch to 100% when the image really is close to full width.
+        // Blowing a small square image up to 100% turns a circle into an
+        // ellipse, which is why round images arrived stretched.
+        const isWide = naturalPx >= availPx * 0.9;
+
+        if (!isWide) {
+          const wPx = Math.min(naturalPx, availPx);
+          const hPx = elH > 0 ? Math.round(elH * (wPx / elW)) : 0;   // keep the aspect ratio
+          return `<div style="margin:0;font-size:0;line-height:0;text-align:${a};">
+            <a href="${el.link || '#'}" target="_blank">
+              <img src="${src}" alt="${el.alt || ''}" width="${wPx}"${hPx ? ` height="${hPx}"` : ''}
+                style="display:inline-block;width:${wPx}px;${hPx ? `height:${hPx}px;object-fit:cover;` : 'height:auto;'}
+                max-width:100%;border-radius:${radiusCss};${bdr}" />
+            </a>
+          </div>`;
+        }
+
         let scaledH = 0;
         if (forceLeft && elH > 0) {
           const refW = colWidthPx || Math.round((elW / CW) * EW);
           scaledH = Math.round(elH * (refW / elW));
         }
-        const heightStyle = scaledH > 0
-          ? `height:${scaledH}px;object-fit:cover;`
-          : 'height:auto;';
-        return `<div style="margin:0;font-size:0;line-height:0;"><img src="${src}" alt="${el.alt || ''}" width="100%" style="display:block;width:100%;max-width:${maxW};${heightStyle}border-radius:${br}px;${bdr}"/></div>`;
+        const heightStyle = scaledH > 0 ? `height:${scaledH}px;object-fit:cover;` : 'height:auto;';
+        return `<div style="margin:0;font-size:0;line-height:0;">
+            <a href="${el.link || '#'}" target="_blank">
+              <img src="${src}" alt="${el.alt || ''}"
+                width="100%"
+                style="display:block;width:100%;max-width:100%;
+                ${heightStyle}
+                border-radius:${radiusCss};${bdr}" />
+            </a>
+          </div>`;  
       }
 
       case 'button': {
-        const ba = align(el, inCard);
-        return `<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:10px 0;"><tr><td align="${ba}"><a href="${el.link || '#'}" style="display:inline-block;padding:${el.padding || '10px 22px'};background-color:${el.backgroundColor || '#C9A84C'};color:${el.color || '#000'};text-decoration:none;border-radius:${el.borderRadius || 6}px;font-weight:${el.fontWeight || '700'};font-size:${el.fontSize || 15}px;font-family:${el.fontFamily || 'Arial,sans-serif'};">${el.content || 'Click Me'}</a></td></tr></table>`;
+        const ba = align(el, inCard, false, card);
+        return `<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:6px 0;"><tr><td align="${ba}"><a href="${el.link || '#'}" style="display:inline-block;padding:${el.padding || '10px 22px'};background-color:${el.backgroundColor || '#C9A84C'};color:${el.color || '#000'};text-decoration:none;border-radius:${el.borderRadius || 6}px;font-weight:${el.fontWeight || '700'};font-size:${el.fontSize || 15}px;font-family:${el.fontFamily || 'Arial,sans-serif'};">${el.content || 'Click Me'}</a></td></tr></table>`;
       }
 
       case 'line':
         return `<div style="margin:8px 0;font-size:0;line-height:0;"><hr style="border:none;height:${el.strokeWidth || 2}px;background:${el.strokeColor || '#333'};margin:0;"/></div>`;
 
-      case 'rectangle': {
-        if (inCard) return ''; // card background already applied — skip
-        const w = `${sc(el.width)}px`;
-        return `<div style="width:${w};height:${sc(el.height) || 40}px;background:${el.backgroundColor || '#4ECDC4'};border-radius:${el.borderRadius || 4}px;${el.borderWidth ? `border:${el.borderWidth}px solid ${el.borderColor || '#000'};` : ''}display:block;margin:4px 0;"></div>`;
-      }
+      /* Rectangle, square, circle and triangle all render through one path.
+         They can carry text and an image fill, so each is a sized box with an
+         optional background image and centred copy. Triangles have no email-safe
+         CSS equivalent — clip-path is stripped by most clients — so they fall
+         back to a rounded box and keep their content readable. */
+      case 'rectangle':
+      case 'square':
+      case 'circle':
+      case 'triangle': {
+        if (inCard && el.type === 'rectangle') return ''; // card background already applied
 
-      case 'circle': {
-        const sz = Math.min(sc(el.width) || 36, sc(el.height) || 36);
-        return `<div style="display:inline-block;width:${sz}px;height:${sz}px;background:${el.backgroundColor || '#FF6B6B'};border-radius:50%;${el.borderWidth ? `border:${el.borderWidth}px solid ${el.borderColor || '#000'};` : ''}vertical-align:middle;"></div>`;
+        const w  = sc(el.width)  || 40;
+        const h  = sc(el.height) || 40;
+        const bw = Number(el.borderWidth) || 0;
+        const bs = el.borderStyle && el.borderStyle !== 'none' ? el.borderStyle : 'solid';
+        const radius = el.type === 'circle' ? '50%'
+                     : el.type === 'triangle' ? '6px'
+                     : `${el.borderRadius ?? 6}px`;
+
+        const bgImage = el.imageSrc
+          ? `background-image:url('${escapeHtml(el.imageSrc)}');background-size:${el.imageFit === 'contain' ? 'contain' : 'cover'};background-position:center;background-repeat:no-repeat;`
+          : '';
+
+        const border = bw > 0 && el.borderStyle !== 'none'
+          ? `border:${bw}px ${bs} ${el.borderColor || '#000'};` : '';
+
+        const valign = el.verticalAlign === 'top' ? 'top'
+                     : el.verticalAlign === 'bottom' ? 'bottom' : 'middle';
+
+        const inner = el.content
+          ? `<span style="font-family:${el.fontFamily || 'Arial,sans-serif'};font-size:${el.fontSize || 16}px;font-weight:${el.fontWeight || '600'};color:${el.color || '#fff'};line-height:${el.lineHeight || 1.3};">${nl2br(el.content)}</span>`
+          : '';
+
+        // A table cell, not a div: Outlook ignores height and vertical centring on divs
+        return `<table cellpadding="0" cellspacing="0" border="0" style="width:${w}px;margin:4px 0;"><tr>`
+             + `<td align="${a}" valign="${valign}" style="width:${w}px;height:${h}px;background-color:${el.backgroundColor || 'transparent'};${bgImage}${border}border-radius:${radius};text-align:${a};padding:6px 10px;box-sizing:border-box;">`
+             + `${inner}</td></tr></table>`;
       }
 
       case 'star': {
         const sz = Math.max(sc(el.width) || 24, 14);
         const clr = el.backgroundColor || el.color || '#FFD700';
         return `<span style="display:inline-block;font-size:${sz}px;line-height:1;color:${clr};vertical-align:middle;">&#9733;</span>`;
-      }
-
-      case 'triangle': {
-        const w = sc(el.width) || 28, h = sc(el.height) || 28;
-        return `<div style="display:inline-block;width:0;height:0;border-left:${Math.round(w / 2)}px solid transparent;border-right:${Math.round(w / 2)}px solid transparent;border-bottom:${h}px solid ${el.backgroundColor || '#FF9F43'};vertical-align:middle;"></div>`;
       }
 
       case 'emoji-icon': {
@@ -314,8 +563,23 @@ function align(el, inCard, forceLeft) {
       }
 
       case 'social': {
-        const sz = Math.min(sc(el.width) || 30, sc(el.height) || 30, 40);
-        return `<a href="${el.link || '#'}" target="_blank" style="display:inline-block;vertical-align:middle;margin:0 3px;"><img src="${el.src || ''}" width="${sz}" height="${sz}" alt="${el.platform || ''}" style="display:inline-block;border:0;border-radius:6px;width:${sz}px;height:${sz}px;"/></a>`;
+        const sz = Math.min(sc(el.width) || 32, sc(el.height) || 32, 40);
+        const cdnIcons = {
+          facebook:  'https://cdn-icons-png.flaticon.com/512/733/733547.png',
+          twitter:   'https://cdn-icons-png.flaticon.com/512/733/733579.png',
+          linkedin:  'https://cdn-icons-png.flaticon.com/512/145/145807.png',
+          instagram: 'https://cdn-icons-png.flaticon.com/512/2111/2111463.png',
+          youtube:   'https://cdn-icons-png.flaticon.com/512/1384/1384060.png',
+          tiktok:    'https://cdn-icons-png.flaticon.com/512/3046/3046126.png',
+          whatsapp:  'https://cdn-icons-png.flaticon.com/512/733/733585.png',
+          pinterest: 'https://cdn-icons-png.flaticon.com/512/145/145808.png',
+        };
+        let src = el.src || '';
+        if (!src || src.startsWith('blob:') || src.startsWith('data:') || src.startsWith('/')) {
+          const platform = (el.platform || '').toLowerCase();
+          src = cdnIcons[platform] || cdnIcons['facebook'];
+        }
+        return `<a href="${el.link || '#'}" target="_blank" style="display:inline-block;vertical-align:middle;margin:0 6px;text-decoration:none;"><img src="${src}" width="${sz}" height="${sz}" alt="${el.platform || 'social'}" style="display:inline;border:0;border-radius:6px;width:${sz}px;height:${sz}px;" /></a>`;
       }
 
       default: return '';
@@ -323,15 +587,10 @@ function align(el, inCard, forceLeft) {
   }
 
   /* ── CARD DETECTION ─────────────────────────────────────────── */
-  // A "card" is a rectangle that contains other elements.
-  // Any element whose CENTER falls within a rectangle's bounds
-  // is treated as a child of that rectangle.
   function centerIn(el, r) {
-    // Primary: element center is inside the rect
     const cx = el.x + el.width / 2;
     const cy = el.y + el.height / 2;
     if (cx >= r.x && cx <= r.x + r.width && cy >= r.y && cy <= r.y + r.height) return true;
-    // Fallback: element significantly overlaps the rect (>50% of element area)
     const ix = Math.max(0, Math.min(el.x + el.width, r.x + r.width) - Math.max(el.x, r.x));
     const iy = Math.max(0, Math.min(el.y + el.height, r.y + r.height) - Math.max(el.y, r.y));
     const overlap = ix * iy;
@@ -339,8 +598,26 @@ function align(el, inCard, forceLeft) {
     return elArea > 0 && overlap / elArea > 0.50;
   }
 
-  // Deduplicate overlapping rects: skip transparent grid overlays sharing same bounds
-  const allRects = els.filter(e => e.type === 'rectangle');
+  /* A "card" is a shape other elements sit on top of. Only rectangles used to
+     qualify, so a design built on a square, circle or triangle container had
+     its background emitted as one unit and every child as separate stacked
+     units — the layout fell apart in the inbox.
+
+     Rectangles keep the old rule (always a container, matching existing
+     templates). The newer shapes must be large AND actually hold something,
+     so a small decorative circle stays a plain element. */
+  const CONTAINER_TYPES = ['rectangle', 'square', 'circle', 'triangle'];
+
+  const holdsChildren = (c) => els.some(el =>
+    el.id !== c.id && !CONTAINER_TYPES.includes(el.type) && centerIn(el, c));
+
+  const allRects = els.filter(e =>
+    e.type === 'rectangle' ||
+    (CONTAINER_TYPES.includes(e.type)
+      && e.width  >= CW * 0.30
+      && e.height >= 120
+      && holdsChildren(e))
+  );
   const skipRectIds = new Set();
   for (let i = 0; i < allRects.length; i++) {
     for (let j = i + 1; j < allRects.length; j++) {
@@ -363,9 +640,13 @@ function align(el, inCard, forceLeft) {
   const cardMap = new Map();
   rects.forEach(r => cardMap.set(r.id, { bg: r, kids: [] }));
 
+  // A shape acting as a card background must not also be placed inside one
+  const cardBgIds = new Set(rects.map(r => r.id));
+
   const orphans = [];
   els.forEach(el => {
     if (el.type === 'rectangle') return;
+    if (cardBgIds.has(el.id)) return;
     let best = null, bestA = Infinity;
     rects.forEach(r => {
       if (centerIn(el, r)) {
@@ -379,172 +660,135 @@ function align(el, inCard, forceLeft) {
 
   /* ── CARD RENDERER ──────────────────────────────────────────── */
   function renderCard(bg, kids) {
-    const bgC = bg.backgroundColor || '#1A1A1A';
-    const rad = Number(bg.borderRadius) || 8;
-    const bdr = bg.borderWidth ? `border:${bg.borderWidth}px solid ${bg.borderColor || '#444'};` : '';
-    const sorted = [...kids].sort((a, b) => a.y - b.y);
-
-    /* ── SIDE-BY-SIDE SPLIT DETECTION ──────────────────────────
-       Detect split layout: image on RIGHT side of card (left-edge
-       starts past 45% of card width) and not a full-bleed top image.
-       ALL other children go to the left column.
-
-       BULLET ROW LOGIC:
-       Each feature bullet can be made of up to 3 elements at the same Y:
-         - A circle (background shape)
-         - A paragraph used as emoji/icon (small width, same x as circle)
-         - A paragraph with the feature text (further right, e.g. x+62)
-       We group all elements that share the same Y "row band" into bullet rows,
-       render them as icon+text pairs, and never render anything twice.  */
-    const cardRight2 = bg.x + bg.width;
-
-    // ── Shared band builder ────────────────────────────────────────────────
-    function buildBands(items) {
-      const used = new Set();
-      const bands = [];
-      for (let i = 0; i < items.length; i++) {
-        if (used.has(i)) continue;
-        const el = items[i];
-        const band = [{ idx: i, el }];
-        used.add(i);
-        let bTop = el.y, bBot = el.y + el.height;
-        let changed = true;
-        while (changed) {
-          changed = false;
-          for (let j = 0; j < items.length; j++) {
-            if (used.has(j)) continue;
-            const k = items[j];
-            if (k.y < bBot + 10 && k.y + k.height > bTop - 10) {
-              band.push({ idx: j, el: k }); used.add(j);
-              bTop = Math.min(bTop, k.y); bBot = Math.max(bBot, k.y + k.height);
-              changed = true;
-            }
-          }
-        }
-        bands.push(band);
+    // Special handling for email footer card
+    const hasButton = kids.some(k => k.type === 'button' && k.content && k.content.includes('FIND YOUR VOICE'));
+    const hasSocialIcons = kids.some(k => k.type === 'social');
+    const hasUnsubscribe = kids.some(k => k.type === 'heading' && k.content === 'Unsubscribe');
+    
+    if (hasSocialIcons && (hasUnsubscribe || hasButton)) {
+      // This is the email footer card - use table-based layout
+      const sorted = [...kids].sort((a, b) => a.y - b.y);
+      
+      // Extract elements
+      const button = sorted.find(k => k.type === 'button');
+      const networkText = sorted.find(k => k.type === 'paragraph' && k.content && k.content.includes('professional network'));
+      const unsubscribe = sorted.find(k => k.type === 'heading' && k.content === 'Unsubscribe');
+      const divider1 = sorted.find(k => k.type === 'line' && k.y < 150);
+      const phone = sorted.find(k => k.type === 'paragraph' && k.content && (k.content.includes('📞') || k.content.match(/\d{3}[-.\s]\d{3}/)));
+      const separator = sorted.find(k => k.type === 'paragraph' && k.content === '|');
+      const email = sorted.find(k => k.type === 'paragraph' && k.content && k.content.includes('@'));
+      const socialIcons = sorted.filter(k => k.type === 'social');
+      const divider2 = sorted.find(k => k.type === 'line' && k.y > 200);
+      
+      // Build HTML table structure
+      let html = `<table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${bg.backgroundColor || '#1a1008'};border-radius:${bg.borderRadius || 0}px;">`;
+      
+      // Button row
+      if (button) {
+        html += `<tr><td style="padding:16px 0 8px;text-align:center;">
+          <a href="${button.link || '#'}" style="display:inline-block;padding:${button.padding || '10px 22px'};background-color:${button.backgroundColor || '#c2831f'};color:${button.color || '#ffffff'};text-decoration:none;border-radius:${button.borderRadius || 24}px;font-weight:${button.fontWeight || '700'};font-size:${button.fontSize || 14}px;font-family:${button.fontFamily || 'Arial, sans-serif'};">${button.content || 'Button'}</a>
+        </td></tr>`;
       }
-      return bands;
-    }
-
-    // ── Shared band renderer ───────────────────────────────────────────────
-    function renderBands(bands) {
-      let html = '';
-      for (const band of bands) {
-        const bandEls = band.map(b => b.el);
-        const iconEls = bandEls.filter(e =>
-          ['circle','emoji-icon','star'].includes(e.type) ||
-          (e.type === 'paragraph' && e.width <= 50)
-        );
-        const textEls = bandEls.filter(e =>
-          ['paragraph','heading','subheading'].includes(e.type) && e.width > 50
-        );
-        if (iconEls.length > 0 && textEls.length > 0) {
-          const emojiEl  = iconEls.find(e => e.type === 'paragraph');
-          const circleEl = iconEls.find(e => e.type === 'circle');
-          const emojiIconEl = iconEls.find(e => e.type === 'emoji-icon');
-          const starEl   = iconEls.find(e => e.type === 'star');
-
-          let iconHtml = '';
-          if (emojiEl && circleEl) {
-            // Render emoji inside its circle badge — preserves the coloured badge + emoji
-            const bgColor  = circleEl.backgroundColor || '#FFF8E0';
-            const bdColor  = circleEl.borderColor || '#C9A84C';
-            const bdWidth  = circleEl.borderWidth  || 2;
-            const sz       = Math.min(sc(circleEl.width) || 28, 36);
-            const emoji    = emojiEl.content || '';
-            const fSize    = Math.round(sz * 0.55);
-            iconHtml = `<div style="display:inline-block;width:${sz}px;height:${sz}px;line-height:${sz}px;text-align:center;background:${bgColor};border:${bdWidth}px solid ${bdColor};border-radius:50%;font-size:${fSize}px;vertical-align:middle;box-sizing:border-box;">${emoji}</div>`;
-          } else if (emojiEl) {
-            // Emoji without a circle — render it simply
-            const emoji  = emojiEl.content || '';
-            const fSize  = emojiEl.fontSize || 18;
-            iconHtml = `<span style="display:inline-block;font-size:${fSize}px;line-height:1;vertical-align:middle;">${emoji}</span>`;
-          } else if (emojiIconEl) {
-            const eEmoji = emojiIconEl.emoji || '⭐';
-            const eFSize = emojiIconEl.fontSize || 24;
-            iconHtml = `<span style="display:inline-block;font-size:${eFSize}px;line-height:1;vertical-align:middle;">${eEmoji}</span>`;
-          } else if (starEl) {
-            iconHtml = renderEl(starEl, true);
-          } else if (circleEl) {
-            iconHtml = renderEl(circleEl, true);
-          }
-
-          const textHtml = textEls.sort((a,b) => a.y - b.y).map(e => renderEl(e, true)).join('');
-          html += '<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 10px 0;border-collapse:collapse;"><tr>'
-            + '<td width="36" valign="middle" style="padding-right:10px;vertical-align:middle;">' + iconHtml + '</td>'
-            + '<td valign="middle" style="vertical-align:middle;">' + textHtml + '</td>'
-            + '</tr></table>';
-        } else {
-          const nonCircle = bandEls.filter(e => !['circle','star'].includes(e.type));
-          (nonCircle.length > 0 ? nonCircle : []).forEach(e => { html += renderEl(e, true); });
-        }
+      
+      // Network text row
+      if (networkText) {
+        html += `<tr><td style="padding:0 20px 8px;text-align:center;">
+          <p style="margin:0;color:${networkText.color || '#d4c9b0'};font-size:${networkText.fontSize || 12}px;font-family:${networkText.fontFamily || 'Arial, sans-serif'};">${networkText.content || ''}</p>
+        </td></tr>`;
       }
+      
+      // Unsubscribe row
+      if (unsubscribe) {
+        html += `<tr><td style="padding:0 0 8px;text-align:center;">
+          <a href="#" style="color:${unsubscribe.color || '#c2831f'};font-size:${unsubscribe.fontSize || 13}px;font-weight:${unsubscribe.fontWeight || '700'};text-decoration:none;">${unsubscribe.content || 'Unsubscribe'}</a>
+        </td></tr>`;
+      }
+      
+      // First divider
+      if (divider1) {
+        html += `<tr><td style="padding:0 20px;">
+          <hr style="border:none;height:${divider1.strokeWidth || 1}px;background:${divider1.strokeColor || '#3d2e10'};margin:0;"/>
+        </td></tr>`;
+      }
+      
+      // Contact info row
+      html += `<tr><td style="padding:8px 20px;">
+        <table width="100%" cellpadding="0" cellspacing="0" border="0">
+          <tr>`;
+      
+      // Phone
+      if (phone) {
+        html += `<td style="text-align:right;padding-right:10px;">
+          <p style="margin:0;color:${phone.color || '#4da6ff'};font-size:${phone.fontSize || 13}px;font-family:${phone.fontFamily || 'Arial, sans-serif'};">${phone.content || ''}</p>
+        </td>`;
+      }
+      
+      // Separator
+      if (separator) {
+        html += `<td style="text-align:center;padding:0 10px;">
+          <p style="margin:0;color:${separator.color || '#6b5a3a'};font-size:${separator.fontSize || 14}px;font-family:${separator.fontFamily || 'Arial, sans-serif'};">${separator.content || ''}</p>
+        </td>`;
+      }
+      
+      // Email
+      if (email) {
+        html += `<td style="text-align:left;padding-left:10px;">
+          <a href="mailto:${email.content || ''}" style="color:${email.color || '#4da6ff'};font-size:${email.fontSize || 13}px;font-family:${email.fontFamily || 'Arial, sans-serif'};text-decoration:none;">${email.content || ''}</a>
+        </td>`;
+      }
+      
+      html += `</tr></table>
+      </td></tr>`;
+      
+      // Social icons row
+      if (socialIcons.length > 0) {
+        html += `<tr><td style="padding:8px 0 16px;text-align:center;">`;
+        
+        socialIcons.forEach(icon => {
+          const cdnIcons = {
+            facebook:  'https://cdn-icons-png.flaticon.com/512/733/733547.png',
+            twitter:   'https://cdn-icons-png.flaticon.com/512/733/733579.png',
+            linkedin:  'https://cdn-icons-png.flaticon.com/512/145/145807.png',
+            instagram: 'https://cdn-icons-png.flaticon.com/512/2111/2111463.png',
+            youtube:   'https://cdn-icons-png.flaticon.com/512/1384/1384060.png',
+            tiktok:    'https://cdn-icons-png.flaticon.com/512/3046/3046126.png',
+            whatsapp:  'https://cdn-icons-png.flaticon.com/512/733/733585.png',
+            pinterest: 'https://cdn-icons-png.flaticon.com/512/145/145808.png',
+          };
+          let iconSrc = icon.src || '';
+          if (!iconSrc || iconSrc.startsWith('blob:') || iconSrc.startsWith('data:') || iconSrc.startsWith('/')) {
+            const platform = (icon.platform || '').toLowerCase();
+            iconSrc = cdnIcons[platform] || cdnIcons['facebook'];
+          }
+          const iconSz = Math.min(sc(icon.width) || 32, sc(icon.height) || 32, 40);
+          html += `<a href="${icon.link || '#'}" target="_blank" style="display:inline-block;margin:0 6px;text-decoration:none;"><img src="${iconSrc}" width="${iconSz}" height="${iconSz}" alt="${icon.platform || 'social'}" style="display:inline;border:0;border-radius:6px;width:${iconSz}px;height:${iconSz}px;vertical-align:middle;" /></a>`;
+        });
+        
+        html += `</td></tr>`;
+      }
+      
+      // Second divider
+      if (divider2) {
+        html += `<tr><td style="padding:0 20px 16px;">
+          <hr style="border:none;height:${divider2.strokeWidth || 2}px;background:${divider2.strokeColor || '#c2831f'};margin:0;"/>
+        </td></tr>`;
+      }
+      
+      html += `</table>`;
       return html;
     }
-
-    // Image RIGHT: left-edge >= 45% of card width (all coords relative to card)
-    const sideImg = sorted.find(k =>
-      k.type === 'image' &&
-      (k.x - bg.x) >= bg.width * 0.45 &&
-      (k.y - bg.y) >= 15
-    );
-
-    // Image LEFT: starts in left 25% of card, right-edge within left 60% of card
-    const sideImgLeft = !sideImg && sorted.find(k =>
-      k.type === 'image' &&
-      (k.x - bg.x) >= 0 &&
-      (k.x - bg.x) < bg.width * 0.25 &&
-      (k.x + k.width - bg.x) <= bg.width * 0.60 &&
-      (k.y - bg.y) >= 15
-    );
-
-    if (sideImgLeft) {
-      /* ── IMAGE LEFT, TEXT RIGHT ── */
-      let src = sideImgLeft.src || '';
-      if (!src || src.startsWith('blob:') || src.startsWith('data:')) src = 'https://via.placeholder.com/260x220?text=Image';
-      if (!src.startsWith('http://') && !src.startsWith('https://')) src = `${process.env.API_BASE_URL}${src}`;
-
-      const rightSorted = sorted.filter(k => k !== sideImgLeft).sort((a, b) => a.y - b.y);
-      const rightHtml = renderBands(buildBands(rightSorted));
-      const imgColPct = Math.round(((sideImgLeft.x + sideImgLeft.width - bg.x) / bg.width) * 100);
-      const textColPct = 100 - imgColPct;
-      // Use the card's actual height for the image (not just the image element height)
-      // so both columns fill the full card
-      const imgHeightPx = Math.round((bg.height / bg.height) * (sc(bg.height) || 220));
-
-      return '<table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:' + bgC + ';border-radius:' + rad + 'px;' + bdr + 'overflow:hidden;border-collapse:collapse;">'
-        + '<tr>'
-        + '<td width="' + imgColPct + '%" valign="middle" style="padding:0;vertical-align:middle;font-size:0;line-height:0;">'
-        + '<img src="' + src + '" alt="" width="100%" style="display:block;width:100%;height:auto;min-height:' + Math.round(sc(sideImgLeft.height)) + 'px;object-fit:cover;border-radius:' + rad + 'px 0 0 ' + rad + 'px;"/>'
-        + '</td>'
-        + '<td width="' + textColPct + '%" valign="top" style="padding:16px 16px 16px 14px;vertical-align:top;">' + rightHtml + '</td>'
-        + '</tr>'
-        + '</table>';
-    }
-
-    if (sideImg) {
-      /* ── TEXT LEFT, IMAGE RIGHT ── */
-      let src = sideImg.src || '';
-      if (!src || src.startsWith('blob:') || src.startsWith('data:')) src = 'https://via.placeholder.com/260x220?text=Image';
-      if (!src.startsWith('http://') && !src.startsWith('https://')) src = `${process.env.API_BASE_URL}${src}`;
-
-      const leftSorted = sorted.filter(k => k !== sideImg).sort((a, b) => a.y - b.y);
-      const leftHtml = renderBands(buildBands(leftSorted));
-      const imgColPct = Math.round(((cardRight2 - sideImg.x) / bg.width) * 100);
-      const textColPct = 100 - imgColPct;
-      const imgHeightPx = Math.round((sideImg.height / bg.height) * 220);
-
-      return '<table width="100%" cellpadding="0" cellspacing="0" border="0" style="background:' + bgC + ';border-radius:' + rad + 'px;' + bdr + 'overflow:hidden;border-collapse:collapse;">'
-        + '<tr>'
-        + '<td width="' + textColPct + '%" valign="top" style="padding:16px 14px 16px 16px;vertical-align:top;">' + leftHtml + '</td>'
-        + '<td width="' + imgColPct + '%" valign="middle" style="padding:0;vertical-align:middle;font-size:0;line-height:0;">'
-        + '<img src="' + src + '" alt="" width="100%" style="display:block;width:100%;height:' + imgHeightPx + 'px;max-height:' + imgHeightPx + 'px;object-fit:cover;border-radius:0 ' + rad + 'px ' + rad + 'px 0;"/>'
-        + '</td>'
-        + '</tr>'
-        + '</table>';
-    }
-
-        /* ── ORIGINAL STACKED LAYOUT (unchanged for other card types) ── */
+    
+    // Regular card rendering (existing code)
+    const bgC = bg.backgroundColor && bg.backgroundColor !== 'transparent'
+      ? bg.backgroundColor : 'transparent';
+    // Circle containers can't be circular in email without clipping the copy,
+    // so they render as a heavily rounded box — the nearest safe equivalent.
+    const rad = bg.type === 'circle' ? 999 : (Number(bg.borderRadius) || 8);
+    const bStyle = bg.borderStyle && bg.borderStyle !== 'none' ? bg.borderStyle : 'solid';
+    const bdr = Number(bg.borderWidth) > 0
+      ? `border:${bg.borderWidth}px ${bStyle} ${bg.borderColor || '#444'};`
+      : '';
+    const sorted = [...kids].sort((a, b) => a.y - b.y);
 
     // Top-image: image whose top edge is within 20px of card top
     const topImg = sorted.find(k => k.type === 'image' && (k.y - bg.y) < 20);
@@ -564,6 +808,30 @@ function align(el, inCard, forceLeft) {
       }
     }
 
+    /* Row grouping is computed up front because the table's column count is
+       set by its widest row, and every earlier row needs to span that many
+       columns. Emitting a single-<td> row into a 3-column table is what
+       pinned the whole design to the left third of the card. */
+    const restSorted = [...rest].sort((a, b) => a.y !== b.y ? a.y - b.y : a.x - b.x);
+    const rowGroups = [];
+    restSorted.forEach(k => {
+      const kMidY = k.y + k.height / 2;
+      const existing = rowGroups.find(g =>
+        g.some(m => {
+          const mMidY = m.y + m.height / 2;
+          return Math.abs(kMidY - mMidY) < Math.min(k.height, m.height) * 0.6;
+        })
+      );
+      if (existing) existing.push(k);
+      else rowGroups.push([k]);
+    });
+    /* The card table is deliberately ONE column. Mixing single- and
+       multi-cell rows made HTML confine each lone cell to column 1, and that
+       column got sized by the narrowest item in the widest row — a social
+       icon — so headings, paragraphs and images were crushed to its width.
+       Side-by-side groups now live in a nested table inside the single cell,
+       so no row can affect any other row's width. colspan is not needed. */
+
     let rows = '';
 
     // Full-bleed top image
@@ -576,24 +844,42 @@ function align(el, inCard, forceLeft) {
 
     // Icon + heading side by side
     if (iconEl) {
-      rows += `<tr><td style="padding:12px 16px 4px;"><table width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td width="44" valign="middle" style="padding-right:8px;">${renderEl(iconEl, true)}</td><td valign="middle">${renderEl(headEl, true)}</td></tr></table></td></tr>`;
+      rows += `<tr><td style="padding:12px 16px 4px;"><table width="100%" cellpadding="0" cellspacing="0" border="0"><tr><td width="44" valign="middle" style="padding-right:8px;">${renderEl(iconEl, true, false, undefined, bg)}</td><td valign="middle">${renderEl(headEl, true, false, undefined, bg)}</td></tr></table></td></tr>`;
     }
 
-    // Body content — sort by Y, render each element in its own <tr> with gap spacing
+    // Body content — sort by Y, group elements at same Y into one row (side-by-side)
     if (rest.length > 0) {
-      const restSorted = [...rest].sort((a, b) => a.y - b.y);
       const topPad = (topImg || iconEl) ? '6' : '16';
-      restSorted.forEach((k, idx) => {
-        // Calculate Y-gap from previous element to preserve canvas spacing
+
+      rowGroups.forEach((group, gIdx) => {
+        // Y-gap from previous row
         let gapPx = 0;
-        if (idx > 0) {
-          const prev = restSorted[idx - 1];
-          const canvasGap = Math.max(0, k.y - (prev.y + prev.height));
+        if (gIdx > 0) {
+          const prevGroup = rowGroups[gIdx - 1];
+          const prevBottom = Math.max(...prevGroup.map(m => m.y + m.height));
+          const curTop = Math.min(...group.map(m => m.y));
+          const canvasGap = Math.max(0, curTop - prevBottom);
           gapPx = Math.round(canvasGap * (EW / CW));
         }
-        const padTop = idx === 0 ? topPad : (gapPx > 2 ? gapPx : 4);
-        const padBot = idx === restSorted.length - 1 ? '16' : '0';
-        rows += `<tr><td style="padding:${padTop}px 16px ${padBot}px;">${renderEl(k, true)}</td></tr>`;
+        const padTop = gIdx === 0 ? 6 : Math.min(gapPx, 10);
+        const padBot = gIdx === rowGroups.length - 1 ? '16' : '0';
+
+        let inner;
+        if (group.length === 1) {
+          inner = renderEl(group[0], true, false, undefined, bg);
+        } else {
+          const sortedByX = [...group].sort((a, b) => a.x - b.x);
+          const colW = Math.round(100 / sortedByX.length);
+          inner = `<table width="100%" cellpadding="0" cellspacing="0" border="0" style="table-layout:fixed;"><tr>`
+            + sortedByX.map((k, kIdx) => {
+                const lPad = kIdx === 0 ? 0 : 4;
+                const rPad = kIdx === sortedByX.length - 1 ? 0 : 4;
+                return `<td width="${colW}%" valign="middle" style="padding:0 ${rPad}px 0 ${lPad}px;text-align:center;">`
+                     + `${renderEl(k, true, false, undefined, bg)}</td>`;
+              }).join('')
+            + `</tr></table>`;
+        }
+        rows += `<tr><td style="padding:${padTop}px 16px ${padBot}px;">${inner}</td></tr>`;
       });
     }
 
@@ -601,8 +887,6 @@ function align(el, inCard, forceLeft) {
   }
 
   /* ── BUILD LAYOUT UNITS ─────────────────────────────────────── */
-  // Each "unit" = one rendered block with its canvas x/y/width
-  // so we can position it correctly in the email layout.
   const units = [];
 
   cardMap.forEach(({ bg, kids }) => {
@@ -612,133 +896,50 @@ function align(el, inCard, forceLeft) {
     });
   });
 
-  orphans.forEach(el => {
-    units.push({ x: el.x, y: el.y, cw: el.width, ch: el.height, elType: el.type, origId: el.id, _el: el, html: renderEl(el, false) });
+  // Group orphan elements that share the same Y band (side-by-side on canvas)
+  const orphansSorted = [...orphans].sort((a, b) => a.y !== b.y ? a.y - b.y : a.x - b.x);
+  const orphanGroups = [];
+  orphansSorted.forEach(el => {
+    const elMidY = el.y + el.height / 2;
+    const existing = orphanGroups.find(g =>
+      g.some(m => Math.abs(elMidY - (m.y + m.height / 2)) < Math.min(el.height, m.height) * 0.6)
+    );
+    if (existing) existing.push(el);
+    else orphanGroups.push([el]);
   });
 
-  // ── PRE-MERGE: Fix image + stacked-text side-by-side layout ────────────────
-  // Problem: image (left) + two paragraphs (right, stacked vertically).
-  // groupRows correctly groups Para1 with the image (Y overlap), but Para2
-  // also Y-overlaps the image yet X-overlaps Para1 → gets rejected into its
-  // own new row → renders full-width below the image.
-  //
-  // Fix: for each image unit, find ALL non-image units whose X range does NOT
-  // overlap the image AND whose Y range overlaps the image. Merge those
-  // companion units into one combined "column unit" so groupRows sees only
-  // 2 units (image + merged column) and places them side-by-side.
-  (function mergeImageCompanions() {
-    const imgUnits  = units.filter(u => u.elType === 'image');
-    const nonImgIds = new Set(units.filter(u => u.elType !== 'image').map(u => u.origId));
+  orphanGroups.forEach(group => {
+    const groupY   = Math.min(...group.map(e => e.y));
+    const groupBot = Math.max(...group.map(e => e.y + e.height));
+    const groupX   = Math.min(...group.map(e => e.x));
+    const groupCW  = Math.max(...group.map(e => e.x + e.width)) - groupX;
 
-    imgUnits.forEach(img => {
-      const imgTop = img.y, imgBot = img.y + img.ch;
-      const imgL   = img.x, imgR   = img.x + img.cw;
+    const groupPx = Math.max(1, sc(groupCW));
 
-      // Find companion units: Y overlaps image, X does NOT overlap image
-      const companions = units.filter(u =>
-        u.origId !== img.origId &&
-        u.elType !== 'image' &&
-        // Y overlap with image
-        u.y < imgBot && (u.y + u.ch) > imgTop &&
-        // X does NOT overlap image (they are side-by-side)
-        (u.x + u.cw <= imgL || u.x >= imgR)
-      );
-
-      if (companions.length < 1) return; // nothing to fix
-
-      // Group companions by which X side they're on (left or right of image)
-      const leftComps  = companions.filter(u => u.x + u.cw <= imgL);
-      const rightComps = companions.filter(u => u.x >= imgR);
-
-      [leftComps, rightComps].forEach(group => {
-        if (group.length === 0) return;
-
-        // Remove individual units from the units array
-        group.forEach(u => {
-          const idx = units.indexOf(u);
-          if (idx !== -1) units.splice(idx, 1);
-        });
-
-        if (group.length === 1) {
-          // Single companion — just re-render with forceLeft to fix alignment
-          const u = group[0];
-          units.push({
-            ...u,
-            html: u._el ? renderEl(u._el, false, true) : u.html,
-          });
-          return;
-        }
-
-        // Merge into one tall column unit, re-rendering each el with forceLeft=true
-        // so text on the right side of canvas doesn't get wrongly right-aligned
-        const sorted = [...group].sort((a, b) => a.y - b.y);
-        const minY  = sorted[0].y;
-        const maxBot2 = Math.max(...sorted.map(u => u.y + u.ch));
-        const minX  = Math.min(...sorted.map(u => u.x));
-        const maxR  = Math.max(...sorted.map(u => u.x + u.cw));
-        units.push({
-          x: minX, y: minY,
-          cw: maxR - minX, ch: maxBot2 - minY,
-          elType: sorted[0].elType,
-          origId: sorted[0].origId,
-          // Preserve the canvas Y-gap between stacked companion elements as margin-top.
-          // Scale: gap_px * (EW / CW) converts canvas pixels → email pixels.
-          html: sorted.map((u, idx) => {
-            const baseHtml = u._el ? renderEl(u._el, false, true) : u.html;
-            if (idx === 0) return baseHtml;
-            const prevBot = sorted[idx - 1].y + sorted[idx - 1].ch;
-            const gapPx   = Math.max(0, u.y - prevBot);
-            const emailGap = Math.round(gapPx * (EW / CW));
-            if (emailGap <= 2) return baseHtml;
-            return `<div style="margin-top:${emailGap}px;">${baseHtml}</div>`;
-          }).join(''),
-        });
+    let innerHtml;
+    if (group.length === 1) {
+      // Cell is already the element's exact width, so honour its own textAlign
+      innerHtml = renderEl(group[0], false, true, groupPx);
+    } else {
+      // Side-by-side group — preserve the horizontal gaps between elements too
+      const sortedByX = [...group].sort((a, b) => a.x - b.x);
+      let cells = '';
+      let cursor = groupX;
+      sortedByX.forEach(el => {
+        const gapPx = Math.max(0, sc(el.x - cursor));
+        if (gapPx > 0) cells += `<td width="${gapPx}" style="width:${gapPx}px;font-size:0;line-height:0;">&nbsp;</td>`;
+        const cw = Math.max(1, sc(el.width));
+        cells += `<td class="bc-col" width="${cw}" valign="top" style="width:${cw}px;">${renderEl(el, false, true, cw)}</td>`;
+        cursor = el.x + el.width;
       });
-    });
-  })();
+      innerHtml = `<table cellpadding="0" cellspacing="0" border="0" width="${groupPx}" style="width:${groupPx}px;table-layout:fixed;"><tr>${cells}</tr></table>`;
+    }
 
-  // Sort: top-to-bottom, left-to-right
+    units.push({ x: groupX, y: groupY, cw: groupCW, ch: groupBot - groupY, elType: 'orphan-group', origId: group[0].id, html: innerHtml });
+  });
+
+  // Sort units by Y position
   units.sort((a, b) => a.y !== b.y ? a.y - b.y : a.x - b.x);
-
-  /* ── ROW GROUPING ───────────────────────────────────────────── */
-  // Two units belong to the same "row" (side-by-side columns) if their
-  // Y ranges OVERLAP — i.e. they are visually beside each other on the canvas.
-  // This correctly handles elements of different heights placed side-by-side.
-  function groupRows(units) {
-    // Attach height to each unit (use ch property if set, else fall back to elType defaults)
-    const withH = units.map(u => ({ ...u, ch: u.ch || 40 }));
-
-    const rows = [];
-    withH.forEach(u => {
-      const uTop = u.y;
-      const uBot = u.y + u.ch;
-      let placed = false;
-
-      for (const row of rows) {
-        // Compute the vertical span already occupied by this row
-        const rowTop = Math.min(...row.map(r => r.y));
-        const rowBot = Math.max(...row.map(r => r.y + r.ch));
-
-        // Does u overlap the row's vertical range?
-        const yOverlap = uTop < rowBot && uBot > rowTop;
-        if (!yOverlap) continue;
-
-        // Only group if X ranges do NOT overlap (they must be side-by-side)
-        const xOverlap = row.some(r => !(u.x + u.cw <= r.x || u.x >= r.x + r.cw));
-        if (xOverlap) continue;
-
-        row.push(u); placed = true; break;
-      }
-      if (!placed) rows.push([u]);
-    });
-
-    // Sort each row left-to-right, then rows top-to-bottom
-    rows.forEach(r => r.sort((a, b) => a.x - b.x));
-    rows.sort((a, b) => Math.min(...a.map(r => r.y)) - Math.min(...b.map(r => r.y)));
-    return rows;
-  }
-
-  const rows = groupRows(units);
 
   /* ── HTML OUTPUT ────────────────────────────────────────────── */
   let html = `<!DOCTYPE html>
@@ -747,6 +948,15 @@ function align(el, inCard, forceLeft) {
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
   <title>${subject}</title>
+  <style type="text/css">
+    /* Fixed cell widths reproduce the canvas layout on desktop.
+       On narrow screens they would overflow, so collapse to stacked rows. */
+    @media only screen and (max-width:620px) {
+      .bc-row, .bc-row tr, .bc-cell, .bc-col { display:block !important; width:100% !important; }
+      .bc-gutter { display:none !important; width:0 !important; }
+      .bc-cell img, .bc-col img { max-width:100% !important; height:auto !important; }
+    }
+  </style>
 </head>
 <body style="margin:0;padding:0;background:#f0f0f0;font-family:Arial,sans-serif;">
 <table width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f0f0f0">
@@ -756,65 +966,18 @@ function align(el, inCard, forceLeft) {
 <tr><td style="padding:20px;">
 `;
 
-  rows.forEach(row => {
-
-    if (row.length === 1) {
-      // Single unit: respect its canvas width proportion
-      const u = row[0];
-      const pct = u.cw / CW;                     // fraction of canvas width
-      // Text-type elements should always fill 100% to preserve readability
-      const isTextEl = ['heading','subheading','paragraph','blockquote','button'].includes(u.elType);
-      const colW = (pct >= 0.50 || isTextEl) ? '100%' : `${sc(u.cw)}px`;
-      const cx = (u.x + u.cw / 2) / CW;
-      // Cards and wide elements always use 'left' on the outer wrapper —
-      // the card itself controls internal text alignment via renderCard/renderEl.
-      // Only small standalone elements (images, shapes) use position-based alignment.
-      const tdA = (u.elType === 'card' || colW === '100%') ? 'left'
-        : cx < 0.30 ? 'left' : cx > 0.70 ? 'right' : 'center';
-
-      html += `<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:10px;">
-<tr><td align="${tdA}">
-<table width="${colW}" cellpadding="0" cellspacing="0" border="0">
-<tr><td>${u.html}</td></tr>
-</table></td></tr></table>\n`;
-
-    } else {
-      // Multiple units side-by-side
-      // Recalculate column widths so they sum to 100% and match canvas proportions.
-      // Re-render image units with forceLeft=true so they fill their column cell.
-      const totalCW = row.reduce((s, u) => s + u.cw, 0);
-      // Normalise widths to sum to 100
-      const pcts = row.map(u => Math.round((u.cw / totalCW) * 100));
-      // Correct rounding drift on last column
-      const drift = 100 - pcts.reduce((a, b) => a + b, 0);
-      pcts[pcts.length - 1] += drift;
-
-      html += `<table width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-bottom:10px;">
-<tr>\n`;
-      // Find the tallest unit in the row (usually the image) to detect vertical alignment
-      const rowH = Math.max(...row.map(u => u.ch));
-      const rowTop = Math.min(...row.map(u => u.y));
-
-      row.forEach((u, i) => {
-        const pct = pcts[i];
-        const pad = i < row.length - 1 ? 'padding-right:8px;' : '';
-        // Re-render images with forceLeft so max-width:100% fills the column
-        // Pass colWidthPx so image height scales correctly to column width
-        const colWidthPx = Math.round((pct / 100) * EW);
-        const cellHtml = (u.elType === 'image' && u._el)
-          ? renderEl(u._el, false, true, colWidthPx)
-          : u.html;
-        // Detect vertical alignment: if this unit's Y center is in the middle 
-        // 40% of the row height → middle-align; otherwise top-align
-        const uCenterRatio = u.ch < rowH
-          ? ((u.y - rowTop) + u.ch / 2) / rowH
-          : 0;
-        const va = (u.elType !== 'image' && uCenterRatio > 0.25 && uCenterRatio < 0.75)
-          ? 'middle' : 'top';
-        html += `<td width="${pct}%" valign="${va}" style="${pad}vertical-align:${va};">${cellHtml}</td>\n`;
-      });
-      html += `</tr></table>\n`;
+  // Render all units — preserve canvas Y-gap spacing between each unit
+  units.forEach((unit, idx) => {
+    if (idx > 0) {
+      const prev = units[idx - 1];
+      // Gap = space between bottom of previous unit and top of current unit, scaled to email width
+      const canvasGap = Math.max(0, unit.y - (prev.y + prev.ch));
+      const emailGap = Math.round(canvasGap * (EW / CW));
+      if (emailGap > 2) {
+        html += `<div style="height:${emailGap}px;font-size:0;line-height:0;">&nbsp;</div>\n`;
+      }
     }
+    html += positionRow(unit.x, unit.cw, unit.html);
   });
 
   html += `</td></tr>
@@ -827,7 +990,7 @@ function align(el, inCard, forceLeft) {
 </body></html>`;
 
   return html;
-};
+}
 
 const generatePlainTextFromCanvas = (canvasData, subject, fromName, fromEmail, replyToEmail) => {
   let plainText = `${subject}\n\n`;
@@ -839,8 +1002,21 @@ const generatePlainTextFromCanvas = (canvasData, subject, fromName, fromEmail, r
         case "heading":
         case "subheading":
         case "paragraph":
-          plainText += `${el.content || ""}\n\n`;
+        case "blockquote": {
+          // Strip inline markup; surface links as "text (url)"
+          const txt = String(el.content || "")
+            .replace(/<a\b[^>]*href\s*=\s*["']?([^"'\s>]+)[^>]*>([\s\S]*?)<\/a>/gi, "$2 ($1)")
+            .replace(/<li\b[^>]*>/gi, "\n  - ")
+            .replace(/<\/(ul|ol)\s*>/gi, "\n")
+            .replace(/<br\s*\/?>/gi, "\n")
+            .replace(/<[^>]+>/g, "")
+            .replace(/&nbsp;/gi, " ")
+            .replace(/&amp;/gi, "&")
+            .replace(/&lt;/gi, "<")
+            .replace(/&gt;/gi, ">");
+          plainText += `${txt}\n\n`;
           break;
+        }
         case "image":
           plainText += `[Image: ${el.alt || "Image"}]\n\n`;
           break;
@@ -887,14 +1063,27 @@ router.get("/credits", async (req, res) => {
   }
 });
 
+// ✉️ Sending methods for the From step. USER → SendGrid only, ADMIN → SendGrid + SMTP.
+// Returns account details for display only; SMTP passwords are never sent.
+router.get("/send-methods", async (req, res) => {
+  try {
+    res.json({ success: true, ...(await getSendMethodsFor(req.user)) });
+  } catch (error) {
+    console.error("❌ Error fetching send methods:", error);
+    res.status(500).json({ success: false, error: "Failed to load sending methods" });
+  }
+});
+
 router.post("/send", async (req, res) => {
   try {
     console.log("📨 /api/campaigns/send called by user:", req.user?.id);
 
     // ✅ STEP 0: Destructure FIRST before using any variables
+    let {
+      fromEmail,
+    } = req.body;
     const {
       recipients,
-      fromEmail,
       fromName,
       fromAddress,
       replyToEmail,
@@ -910,6 +1099,37 @@ router.post("/send", async (req, res) => {
       recurringDays,
       recurringEndDate,
     } = req.body;
+
+    // ✉️ Sending method: role-checked on the server (USER can only use SendGrid)
+    let sendMethod;
+    try {
+      sendMethod = resolveSendMethod(req.body.sendMethod, req.user);
+    } catch (e) {
+      return res.status(e.status || 400).json({ error: e.message });
+    }
+
+    if (sendMethod === "SMTP") {
+      const smtp = getSmtpSettings();
+      if (!smtp.configured) {
+        return res.status(400).json({ error: "SMTP is not configured on the server." });
+      }
+      // SMTP always sends from the configured account; the typed address becomes Reply-To.
+      fromEmail = smtp.fromEmail;
+
+      const count = Array.isArray(recipients) ? recipients.length : 0;
+      if ((scheduleType || "immediate") === "immediate") {
+        const usage = await getSmtpUsage();
+        if (count > usage.remaining) {
+          return res.status(400).json({
+            error: `SMTP can send ${usage.remaining} more email(s) today (limit ${usage.dailyLimit}). You selected ${count}. Reduce recipients or use SendGrid.`,
+          });
+        }
+      } else if (count > smtp.dailyLimit) {
+        return res.status(400).json({
+          error: `SMTP daily limit is ${smtp.dailyLimit} emails. You selected ${count}. Reduce recipients or use SendGrid.`,
+        });
+      }
+    }
 
     // Merge background color as sentinel into canvasData
     const canvasData = _bg
@@ -965,12 +1185,11 @@ router.post("/send", async (req, res) => {
     }
 
     // ==========================================================
-    // 🧠 STEP 2: SendGrid setup
+    // 🧠 STEP 2: SendGrid setup (only needed when sending via SendGrid)
     // ==========================================================
-    if (!process.env.SENDGRID_API_KEY) {
+    if (sendMethod === "SENDGRID" && !initCampaignMailer()) {
       return res.status(500).json({ error: "SendGrid API key not configured" });
     }
-    sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
     // ==========================================================
     // 💾 STEP 3: Prepare Scheduled DateTime
@@ -1010,10 +1229,11 @@ router.post("/send", async (req, res) => {
         status:            scheduleType === "immediate" ? "sending" : "scheduled",
         totalBatches: totalBatches,
         currentBatch: 1,
+        sendMethod,
       },
     });
 
-    console.log(`✅ Campaign ${campaign.id} created | recipients: ${recipients.length} | batches: ${totalBatches} | scheduleType: ${scheduleType}`);
+    console.log(`✅ Campaign ${campaign.id} created | via ${sendMethod} | recipients: ${recipients.length} | batches: ${totalBatches} | scheduleType: ${scheduleType}`);
 
     // ==========================================================
     // 🕒 STEP 5: If scheduled or recurring → Save & return early
@@ -1036,7 +1256,7 @@ router.post("/send", async (req, res) => {
       console.log(`   📧 Subject: ${emailSubject}`);
       console.log(`   📅 Date: ${scheduledDate} ${scheduledTime}`);
       console.log(`   👥 Recipients: ${recipients.length}`);
-      console.log(`   🎨 Canvas Elements: ${canvasData?.length || 0}`);
+      // console.log(`   🎨 Canvas Elements: ${canvasData?.length || 0}`);
       console.log(`   ⏰ Scheduled DateTime: ${scheduledDateTime.toISOString()}`);
       console.log(`   📍 Type: ${scheduleType}`);
       console.log(`   ✉️ From: ${fromName} <${fromEmail}>`);
@@ -1117,6 +1337,7 @@ router.post("/send", async (req, res) => {
         ? `🚀 Campaign started! ${recipients.length.toLocaleString()} emails split into ${totalBatches} batch(es) of ${BATCH_SIZE.toLocaleString()}. Estimated ~${estimatedMinutes} min total.`
         : `🚀 Campaign started! Sending ${recipients.length.toLocaleString()} emails now…`,
       campaignId:      campaign.id,
+      sendMethod,
       recipientCount:  recipients.length,
       batchTotal:      totalBatches,
       batchSize:       BATCH_SIZE,
@@ -1145,7 +1366,7 @@ router.post("/send", async (req, res) => {
 
     // ── Launch batch engine in background (non-blocking) ────────
     _sendInBatches(campaign, buildMessage)
-      .then(async () => {
+      .then(async (outcome) => {
         // =======================================================
         // 💰 STEP 7: Deduct credits once ALL batches complete
         // =======================================================
@@ -1193,7 +1414,8 @@ router.post("/send", async (req, res) => {
 
         console.log(`✅ Credits updated — user.emailLimit now ${finalUserEmailLimit}`);
 
-        // 3️⃣ Log completion
+        // 3️⃣ Log completion (a stopped campaign already logged itself as "paused")
+        if (outcome?.stopped) return;
         await prisma.automationLog.create({
           data: {
             userId:       req.user.id,
@@ -1224,11 +1446,44 @@ router.post("/send", async (req, res) => {
 });
 
 
+// router.get("/", async (req, res) => {
+//   try {
+//     const campaigns = await prisma.campaign.findMany({
+//       where: { userId: req.user.id },
+//       include: { events: true },
+//       orderBy: { createdAt: "desc" },
+//     });
+//     res.json(campaigns);
+//   } catch {
+//     res.status(500).json({ error: "Failed to fetch campaigns" });
+//   }
+// });
+
 router.get("/", async (req, res) => {
   try {
     const campaigns = await prisma.campaign.findMany({
       where: { userId: req.user.id },
-      include: { events: true },
+      select: {
+        id: true,
+        name: true,
+        subject: true,
+        status: true,
+        sentCount: true,
+        pending: true,
+        currentBatch: true,
+        totalBatches: true,
+        createdAt: true,
+        fromEmail: true,
+        fromName: true,
+        fromAddress: true,
+        replyToEmail: true,
+        scheduleType: true,
+        scheduledAt: true,
+        // ❌ NO recipientsJson
+        // ❌ NO designJson
+        // ❌ NO snapshotUrl
+        // ❌ NO events  ← REMOVE THIS TOO
+      },
       orderBy: { createdAt: "desc" },
     });
     res.json(campaigns);
@@ -1236,7 +1491,6 @@ router.get("/", async (req, res) => {
     res.status(500).json({ error: "Failed to fetch campaigns" });
   }
 });
-
 router.get("/:id", async (req, res) => {
   try {
     const campaign = await prisma.campaign.findFirst({
@@ -1290,7 +1544,7 @@ router.post("/verify-email", async (req, res) => {
     const response = await fetch('https://api.sendgrid.com/v3/verified_senders', {
       method: 'GET',
       headers: {
-        'Authorization': `Bearer ${process.env.SENDGRID_API_KEY}`,
+        'Authorization': `Bearer ${getCampaignApiKey()}`,
         'Content-Type': 'application/json',
       },
     });
@@ -1424,10 +1678,9 @@ router.post("/send-shuffled", async (req, res) => {
     // ==========================================================
     // 📧 STEP 2: SendGrid setup
     // ==========================================================
-    if (!process.env.SENDGRID_API_KEY) {
+    if (!initCampaignMailer()) {
       return res.status(500).json({ error: "SendGrid API key not configured" });
     }
-    sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
     // ==========================================================
     // 💾 STEP 3: Prepare Scheduled DateTime
@@ -1570,7 +1823,7 @@ router.post("/send-shuffled", async (req, res) => {
 
 
         try {
-          const response = await sgMail.send(msg);
+          const response = await sendCampaignMail(msg);
           if (response[0].statusCode >= 200 && response[0].statusCode < 300) {
             results.success.push({ email, subject });
             actualSentCount++;
@@ -1617,67 +1870,51 @@ router.post("/send-shuffled", async (req, res) => {
         total: emails.length
       });
     }
-    // ==========================================================
-    // 💰 STEP 7: Deduct Credits (ONLY for immediate sends)
-    // ==========================================================
-    if (scheduleType === "immediate") {
-      console.log("💰 Deducting credits after shuffled campaign...");
-      let remainingToDeduct = actualSentCount;
 
-      // Deduct from payments first (FIFO)
-      const succeededPayments = await prisma.payment.findMany({
-        where: { userId: req.user.id, status: "succeeded" },
-        orderBy: { paymentDate: "asc" },
-        select: { id: true, emailSendCredits: true },
-      });
+if (scheduleType === "immediate") {
 
-      for (const p of succeededPayments) {
-        if (remainingToDeduct <= 0) break;
-        const current = p.emailSendCredits || 0;
-        const deduct = Math.min(current, remainingToDeduct);
-        const newCredit = Math.max(0, current - deduct);
+  let remainingToDeduct = actualSentCount;
 
-        await prisma.payment.update({
-          where: { id: p.id },
-          data: { emailSendCredits: newCredit },
-        });
+  const succeededPayments = await prisma.payment.findMany({
+    where: { userId: req.user.id, status: "succeeded" },
+    select: { emailSendCredits: true },
+  });
 
-        remainingToDeduct -= deduct;
-        console.log(`💳 Deducted ${deduct} from payment ${p.id}, remaining: ${remainingToDeduct}`);
-      }
+  const remainingPaymentCredits = succeededPayments.reduce(
+    (sum, p) => sum + (p.emailSendCredits || 0),
+    0
+  );
 
-      // Deduct remaining from user.emailLimit
-      const finalUserEmailLimit = Math.max(0, (user.emailLimit ?? 0) - remainingToDeduct);
+  const finalUserEmailLimit = Math.max(
+    0,
+    (user.emailLimit ?? 0) - remainingToDeduct
+  );
 
-      await prisma.user.update({
-        where: { id: req.user.id },
-        data: { emailLimit: finalUserEmailLimit },
-      });
+  await prisma.user.update({
+    where: { id: req.user.id },
+    data: { emailLimit: finalUserEmailLimit },
+  });
 
-      console.log(`✅ Credits updated – user.emailLimit now ${finalUserEmailLimit}`);
+  const totalRemainingCredits =
+    remainingPaymentCredits + finalUserEmailLimit;
 
-      // Calculate total remaining credits
-      const updatedPayments = await prisma.payment.findMany({
-        where: { userId: req.user.id, status: "succeeded" },
-        select: { emailSendCredits: true },
-      });
-      const remainingPaymentCredits = updatedPayments.reduce((sum, p) => sum + (p.emailSendCredits || 0), 0);
-      const totalRemainingCredits = remainingPaymentCredits + finalUserEmailLimit;
+  return res.status(200).json({
+    success: true,
+    message: `Sent: ${results.success.length}, Failed: ${results.failed.length}`,
+    results,
+    distribution: distributionResults,
+    creditsUsed: actualSentCount,
+    creditsRemaining: totalRemainingCredits,
+  });
+}
 
-      // ==========================================================
-      // 📤 STEP 8: Response for IMMEDIATE send
-      // ==========================================================
-      console.log(`✅ Shuffled campaign complete - Success: ${results.success.length}, Failed: ${results.failed.length}`);
+// If scheduled
+return res.status(200).json({
+  success: true,
+  message: "Shuffled campaign scheduled successfully",
+  distribution: distributionResults,
+});
 
-      return res.status(200).json({
-        success: true,
-        message: `Sent: ${results.success.length}, Failed: ${results.failed.length}`,
-        results,
-        distribution: distributionResults,
-        creditsUsed: actualSentCount,
-        creditsRemaining: totalRemainingCredits,
-      });
-    }
     // Deduct remaining from user.emailLimit
     const finalUserEmailLimit = Math.max(0, (user.emailLimit ?? 0) - remainingToDeduct);
 

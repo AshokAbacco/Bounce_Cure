@@ -9,25 +9,94 @@ import ToolsPanel     from "./../Components/Editor/Toolbox";
 import CanvasArea     from "../Components/Editor/CanvasArea";
 import PropertiesPanel from "../Components/Editor/PropertiesPanel";
 import SaveTemplateModal from "../Components/Editor/SaveTemplate";
+import { TEMPLATE_TYPES } from "./savedTemplateService";
 
 // ── Design tokens ──────────────────────────────────────────────────────────────
-export const T = {
-  bg:       "#0A0A0A",
-  surface:  "#111111",
-  panel:    "#161616",
-  border:   "#2A2200",
-  gold:     "#C9A84C",
-  goldBright:"#F0C040",
-  goldDim:  "#7A6020",
-  muted:    "#5A5040",
-  txt:      "#E8D8A0",
-  txtDim:   "#8A7850",
-  white:    "#F5EDD0",
-  danger:   "#C04020",
-  success:  "#40A060",
+/* ── Editor themes ──────────────────────────────────────────────────────────
+   `T` is a live object: switching mode rewrites its keys in place, so every
+   `style={{ color: T.gold }}` in the editor picks up the new palette on the
+   next render without threading a context through ~300 call sites.
+   Only Template Studio uses it — leaving the editor restores dark.          */
+export const THEMES = {
+  dark: {
+    bg:        "#0A0A0A",
+    surface:   "#111111",
+    panel:     "#161616",
+    border:    "#2A2200",
+    gold:      "#C9A84C",
+    goldBright:"#F0C040",
+    goldDim:   "#7A6020",
+    muted:     "#5A5040",
+    txt:       "#E8D8A0",
+    txtDim:    "#8A7850",
+    white:     "#F5EDD0",
+    danger:    "#C04020",
+    success:   "#40A060",
+    canvasEdge:"rgba(0,0,0,.55)",
+    grid:      "rgba(122,96,32,.22)",   // grid lines over the white page
+    // Top bar and panel headers match the panels in dark mode
+    bar:       "#161616",
+    barTxt:    "#E8D8A0",
+    barAccent: "#C9A84C",     // active/hover colour for controls on the bar
+    barBorder: "#2A2200",
+    label:     "#7A6020",     // section headings in the side panels
+    header:    "transparent",
+    headerTxt: "#C9A84C",
+  },
+  // Blue scheme: white panels, navy top bar, blue accent.
+  // `gold` is really the accent slot — it carries blue here.
+  light: {
+    bg:        "#EDF3FB",   // workspace behind the page
+    surface:   "#FFFFFF",
+    panel:     "#FFFFFF",
+    border:    "#D8E4F3",
+    gold:      "#1A73E8",   // accent
+    goldBright:"#1669D6",
+    goldDim:   "#9CC2F0",
+    muted:     "#7A93B2",
+    txt:       "#132A47",
+    txtDim:    "#5B7392",
+    white:     "#FFFFFF",
+    danger:    "#D93025",
+    success:   "#188038",
+    canvasEdge:"rgba(19,42,71,.14)",
+    grid:      "rgba(26,115,232,.10)",
+    // Navy top bar with white text, and a blue Properties header
+    bar:       "#0D2B4E",
+    barTxt:    "#FFFFFF",
+    barAccent: "#7FB3F5",     // light blue reads on navy; T.gold would not
+    barBorder: "#2C4E77",
+    label:     "#1A73E8",
+    header:    "#1A73E8",
+    headerTxt: "#FFFFFF",
+  },
 };
 
+export const T = { ...THEMES.dark };
+
+export const THEME_KEY = "editorTheme";
+
+/** Swap the live palette. Returns the mode applied. */
+export function applyEditorTheme(mode) {
+  const next = THEMES[mode] ? mode : "dark";
+  Object.assign(T, THEMES[next]);
+  return next;
+}
+
 // ── Element factory ────────────────────────────────────────────────────────────
+/** Text-inside-shape defaults — shapes are containers, not just fills. */
+const SHAPE_TEXT = {
+  fontSize: 16, fontWeight: "600", fontFamily: "Arial",
+  color: "#FFFFFF", textAlign: "center", verticalAlign: "middle",
+  fontStyle: "normal", textDecoration: "none", lineHeight: 1.3,
+  imageSrc: "", imageFit: "cover",
+};
+
+// Defined in editorConstants.js (a leaf module) to keep them out of the
+// EditorPage <-> CanvasArea import cycle. Re-exported so existing imports
+// of `SHAPE_TYPES` from this file keep working.
+export { SHAPE_TYPES, BORDER_STYLES, TEXT_TYPES, LINK_COLOR } from "./editorConstants";
+
 export function makeEl(type, opts = {}) {
   const base = {
     id:       crypto.randomUUID(),
@@ -40,24 +109,26 @@ export function makeEl(type, opts = {}) {
     ...opts,
   };
   const defaults = {
-    heading:    { content:"Add a Heading",   width:380, height:60,  fontSize:36, fontWeight:"bold",   color:"#F0C040", backgroundColor:"transparent", fontFamily:"Georgia", textAlign:"left", fontStyle:"normal", textDecoration:"none", lineHeight:1.3 },
-    subheading: { content:"Add a Subheading",width:320, height:48,  fontSize:24, fontWeight:"600",    color:"#E8D8A0", backgroundColor:"transparent", fontFamily:"Georgia", textAlign:"left", fontStyle:"normal", textDecoration:"none", lineHeight:1.3 },
-    paragraph:  { content:"Add paragraph text here. Click to edit and start typing your content.", width:360, height:80, fontSize:15, fontWeight:"normal", color:"#C8B880", backgroundColor:"transparent", fontFamily:"'Trebuchet MS'", textAlign:"left", fontStyle:"normal", textDecoration:"none", lineHeight:1.6 },
-    blockquote: { content:'"An inspiring quote goes here."', width:340, height:90, fontSize:19, fontWeight:"normal", fontStyle:"italic", color:"#C9A84C", backgroundColor:"transparent", fontFamily:"Georgia", textAlign:"center", lineHeight:1.5 },
-    button:     { content:"Click Me", width:160, height:48, fontSize:15, fontWeight:"700", color:"#0A0A0A", backgroundColor:"#C9A84C", borderRadius:6, fontFamily:"'Trebuchet MS'", textAlign:"center" },
-    rectangle:  { content:"", width:200, height:120, backgroundColor:"#C9A84C", borderRadius:6, borderColor:"transparent", borderWidth:0 },
-    circle:     { content:"", width:110, height:110, backgroundColor:"#7A6020" },
-    star:       { content:"", width:90,  height:90,  backgroundColor:"#F0C040" },
-    line:       { content:"", width:280, height:3,   strokeColor:"#C9A84C", strokeWidth:3 },
+    heading:    { content:"Add a Heading",   width:380, height:60,  fontSize:36, fontWeight:"bold",   color:"#000000", backgroundColor:"transparent", fontFamily:"Georgia", textAlign:"left", fontStyle:"normal", textDecoration:"none", lineHeight:1.3 },
+    subheading: { content:"Add a Subheading",width:320, height:48,  fontSize:24, fontWeight:"600",    color:"#000000", backgroundColor:"transparent", fontFamily:"Georgia", textAlign:"left", fontStyle:"normal", textDecoration:"none", lineHeight:1.3 },
+    paragraph:  { content:"Add paragraph text here. Click to edit and start typing your content.", width:360, height:80, fontSize:15, fontWeight:"normal", color:"#000000", backgroundColor:"transparent", fontFamily:"'Trebuchet MS'", textAlign:"left", fontStyle:"normal", textDecoration:"none", lineHeight:1.6 },
+    blockquote: { content:'"An inspiring quote goes here."', width:340, height:90, fontSize:19, fontWeight:"normal", fontStyle:"italic", color:"#000000", backgroundColor:"transparent", fontFamily:"Georgia", textAlign:"center", lineHeight:1.5 },
+    button:     { content:"Click Me", width:160, height:48, fontSize:15, fontWeight:"700", color:"#FFFFFF", backgroundColor:"#000000", borderRadius:6, fontFamily:"'Trebuchet MS'", textAlign:"center" },
+    rectangle:  { content:"", width:220, height:130, backgroundColor:"#000000", borderRadius:6,  borderColor:"#000000", borderWidth:0, borderStyle:"solid", ...SHAPE_TEXT },
+    square:     { content:"", width:160, height:160, backgroundColor:"#000000", borderRadius:6,  borderColor:"#000000", borderWidth:0, borderStyle:"solid", ...SHAPE_TEXT },
+    circle:     { content:"", width:150, height:150, backgroundColor:"#000000", borderRadius:999, borderColor:"#000000", borderWidth:0, borderStyle:"solid", ...SHAPE_TEXT },
+    triangle:   { content:"", width:170, height:150, backgroundColor:"#000000", borderRadius:0,  borderColor:"#000000", borderWidth:0, borderStyle:"solid", ...SHAPE_TEXT },
+    star:       { content:"", width:90,  height:90,  backgroundColor:"#000000" },
+    line:       { content:"", width:280, height:3,   strokeColor:"#000000", strokeWidth:3 },
     image:      { src: opts.src || "https://images.unsplash.com/photo-1557683316-973673baf926?w=400&h=260&fit=crop", width:300, height:190, borderRadius:4, objectFit:"cover" },
     social:     { src:opts.src, width:44, height:44, platform:opts.platform, link:opts.link||"#" },
     "emoji-icon": { emoji:opts.emoji||"⭐", fontSize:opts.fontSize||32, width:opts.width||48, height:opts.height||48 },
   };
-  return { ...base, ...(defaults[type] || { width:150, height:50 }) };
+  return { ...(defaults[type] || { width:150, height:50 }), ...base };
 }
 
 export const FONTS = ["Georgia","'Trebuchet MS'","'Times New Roman'","Verdana","'Palatino Linotype'","Impact","'Courier New'","'Comic Sans MS'"];
-export const COLORS = ["#F0C040","#C9A84C","#7A6020","#2A2200","#0A0A0A","#1A1A1A","#FFFFFF","#F5EDD0","#C04020","#204060","#406020","#602040","#C8B880","#E8D8A0","#5A5040","#8A7850"];
+export const COLORS = ["#000000","#F0C040","#C9A84C","#7A6020","#2A2200","#0A0A0A","#1A1A1A","#FFFFFF","#F5EDD0","#C04020","#204060","#406020","#602040","#C8B880","#E8D8A0","#5A5040","#8A7850"];
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 export default function TemplateEditorPage() {
@@ -75,6 +146,38 @@ export default function TemplateEditorPage() {
   const [redoStack,   setRedoStack]   = useState([]);
   const [toast,       setToast]       = useState(null);
   const [showExit,    setShowExit]    = useState(false);
+
+  const [themeMode, setThemeMode] = useState(() => {
+    try {
+      return localStorage.getItem(THEME_KEY) === "light" ? "light" : "dark";
+    } catch { return "dark"; }   // private browsing
+  });
+
+  /* Re-assert the palette on EVERY render, not just once.
+
+     `T` is a mutable module object, and the unmount cleanup below resets it to
+     dark so other pages keep their own theme. React StrictMode mounts,
+     unmounts and remounts in development, which fired that cleanup moments
+     after the first mount — leaving T dark while themeMode still said "light".
+     Nothing re-applied it, so the editor flipped back to gold as soon as
+     anything re-rendered (clicking a tool tab, selecting an element, typing).
+
+     Applying here is safe: it's an idempotent write of a constant, and doing
+     it during render means the very next paint already uses the right colours,
+     which an effect could not guarantee. */
+  applyEditorTheme(themeMode);
+
+  const toggleTheme = () => {
+    setThemeMode(prev => {
+      const next = prev === "dark" ? "light" : "dark";
+      applyEditorTheme(next);
+      try { localStorage.setItem(THEME_KEY, next); } catch { /* private browsing */ }
+      return next;
+    });
+  };
+
+  // Template Studio only — restore dark when the editor is actually left
+  useEffect(() => () => { applyEditorTheme("dark"); }, []);
   const [leftTab,     setLeftTab]     = useState("elements"); // "elements"|"photos"|"colors"
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [propOpen,    setPropOpen]    = useState(true);
@@ -259,6 +362,7 @@ export default function TemplateEditorPage() {
   useEffect(() => {
     const h = (e) => {
       if (["INPUT","TEXTAREA","SELECT"].includes(e.target.tagName)) return;
+      if (e.target.isContentEditable || e.target.closest?.(".bc-edit")) return;
       if ((e.metaKey||e.ctrlKey)&&e.key==="z") { e.preventDefault(); undo(); }
       if ((e.metaKey||e.ctrlKey)&&e.key==="y") { e.preventDefault(); redo(); }
       if ((e.metaKey||e.ctrlKey)&&e.key==="d") { e.preventDefault(); duplicateEl(); }
@@ -314,14 +418,14 @@ navigate("/send-campaign", {
       {/* ── TOP NAV BAR ── */}
       <nav style={{
         height:52, display:"flex", alignItems:"center", justifyContent:"space-between",
-        padding:"0 14px", background:T.panel, borderBottom:`1px solid ${T.border}`,
+        padding:"0 14px", background:T.bar, color:T.barTxt, borderBottom:`1px solid ${T.border}`,
         flexShrink:0, gap:10, zIndex:50,
         boxShadow:`0 1px 0 ${T.goldDim}44`,
       }}>
         {/* Logo */}
         <div style={{ display:"flex", alignItems:"center", gap:8, flexShrink:0 }}>
           <div style={{ width:30, height:30, borderRadius:7, background:`linear-gradient(135deg,${T.goldBright},${T.goldDim})`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:15 }}>✦</div>
-          <span style={{ fontWeight:700, fontSize:15, color:T.gold, letterSpacing:".04em", fontFamily:"Georgia" }}>Template Studio</span>
+          <span style={{ fontWeight:700, fontSize:15, color:T.barTxt, letterSpacing:".04em", fontFamily:"Georgia" }}>Template Studio</span>
         </div>
 
         {/* Centre toolbar */}
@@ -340,6 +444,12 @@ navigate("/send-campaign", {
           {/* Panel toggles */}
           <TBtn title="Toggle Tools" active={sidebarOpen} onClick={()=>setSidebarOpen(s=>!s)} style={{fontSize:11}}>☰</TBtn>
           <TBtn title="Toggle Properties" active={propOpen} onClick={()=>setPropOpen(p=>!p)} style={{fontSize:11}}>⚙</TBtn>
+          <Sep/>
+          <TBtn
+            title={themeMode === "dark" ? "Switch to light mode" : "Switch to dark mode"}
+            onClick={toggleTheme}
+            style={{ fontSize:13 }}
+          >{themeMode === "dark" ? "☀" : "☾"}</TBtn>
         </div>
 
         {/* Right */}
@@ -368,10 +478,12 @@ navigate("/send-campaign", {
         {showSaveModal && (
         // CORRECT ✅
         <SaveTemplateModal
-          userId={userId}
-          canvasData={pages[activePage]?.elements}
+          type={TEMPLATE_TYPES.CANVAS}
+          content={pages[activePage]?.elements}
           canvasBackground={pages[activePage]?.bgColor}
+          defaultName={template?.name || ""}
           onClose={() => setShowSaveModal(false)}
+          onSaved={(row) => showToast(`Saved "${row.name}"`)}
         />
         )}
       </nav>
@@ -452,21 +564,21 @@ export function TBtn({ children, onClick, disabled, active, title, style }) {
   return (
     <button onClick={onClick} disabled={disabled} title={title}
       style={{
-        width:30, height:30, borderRadius:6, border:`1px solid ${active?T.gold:T.border}`,
-        background: active ? `${T.gold}22` : "transparent",
-        color: active ? T.gold : disabled ? T.muted : T.txt,
+        width:30, height:30, borderRadius:6, border:`1px solid ${active?T.barAccent:T.barBorder}`,
+        background: active ? `${T.barAccent}33` : "transparent",
+        color: active ? T.barAccent : disabled ? T.muted : T.barTxt,
         cursor: disabled ? "not-allowed" : "pointer",
         fontSize:14, display:"flex", alignItems:"center", justifyContent:"center",
         opacity: disabled ? .4 : 1, flexShrink:0, transition:"all .12s", ...style,
       }}
-      onMouseOver={e=>{ if(!disabled){ e.currentTarget.style.borderColor=T.gold; e.currentTarget.style.color=T.gold; } }}
-      onMouseOut={e=>{ e.currentTarget.style.borderColor=active?T.gold:T.border; e.currentTarget.style.color=active?T.gold:disabled?T.muted:T.txt; }}
+      onMouseOver={e=>{ if(!disabled){ e.currentTarget.style.borderColor=T.barAccent; e.currentTarget.style.color=T.barAccent; } }}
+      onMouseOut={e=>{ e.currentTarget.style.borderColor=active?T.barAccent:T.barBorder; e.currentTarget.style.color=active?T.barAccent:disabled?T.muted:T.barTxt; }}
     >{children}</button>
   );
 }
-export function Sep() { return <div style={{ width:1, height:22, background:T.border, margin:"0 2px" }} />; }
+export function Sep() { return <div style={{ width:1, height:22, background:T.barBorder, margin:"0 2px" }} />; }
 export function SLabel({ children }) {
-  return <div style={{ fontSize:10, fontWeight:700, color:T.goldDim, letterSpacing:".1em", textTransform:"uppercase", marginBottom:7 }}>{children}</div>;
+  return <div style={{ fontSize:10, fontWeight:700, color:T.label, letterSpacing:".1em", textTransform:"uppercase", marginBottom:7 }}>{children}</div>;
 }
 export function PRow({ label, children }) {
   return (
@@ -477,10 +589,28 @@ export function PRow({ label, children }) {
   );
 }
 export const inputStyle = {
-  width:"100%", padding:"7px 10px", borderRadius:7,
-  border:`1px solid ${T.border}`, background:T.surface,
-  fontSize:13, color:T.txt, outline:"none",
+  width:"100%", padding:"7px 10px", borderRadius:7, fontSize:13, outline:"none",
+  get border()     { return `1px solid ${T.border}`; },
+  get background() { return T.surface; },
+  get color()      { return T.txt; },
 };
-export const selectStyle = { ...{ width:"100%", padding:"7px 10px", borderRadius:7, border:`1px solid ${T.border}`, background:T.surface, fontSize:13, color:T.txt, outline:"none" } };
-const primaryBtn = { padding:"7px 18px", borderRadius:7, border:`1px solid ${T.gold}`, background:`linear-gradient(135deg,${T.gold},${T.goldDim})`, color:T.bg, fontWeight:700, cursor:"pointer", fontSize:13, fontFamily:"inherit" };
-const outlineBtn = { padding:"7px 14px", borderRadius:7, border:`1px solid ${T.border}`, background:"transparent", color:T.txtDim, cursor:"pointer", fontSize:13, fontFamily:"inherit" };
+export const selectStyle = {
+  width:"100%", padding:"7px 10px", borderRadius:7, fontSize:13, outline:"none",
+  get border()     { return `1px solid ${T.border}`; },
+  get background() { return T.surface; },
+  get color()      { return T.txt; },
+};
+const primaryBtn = {
+  padding:"7px 18px", borderRadius:7, fontWeight:700, cursor:"pointer",
+  fontSize:13, fontFamily:"inherit",
+  get border()     { return `1px solid ${T.gold}`; },
+  get background() { return `linear-gradient(135deg,${T.gold},${T.goldDim})`; },
+  get color()      { return T.bg; },
+};
+// Sits on the top bar, so it follows the bar tokens
+const outlineBtn = {
+  padding:"7px 14px", borderRadius:7, background:"transparent",
+  cursor:"pointer", fontSize:13, fontFamily:"inherit",
+  get border() { return `1px solid ${T.barBorder}`; },
+  get color()  { return T.barTxt; },
+};

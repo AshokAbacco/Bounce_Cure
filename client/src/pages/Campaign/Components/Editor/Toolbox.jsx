@@ -13,6 +13,7 @@
 import React, { useRef, useState, useMemo } from "react";
 import { T, SLabel, inputStyle, COLORS } from "../../pages/EditorPage";
 import PhotosTab from "./PhotosTab";
+import { newListContent } from "./richText";
 // ─── Stock photos ─────────────────────────────────────────────────────────────
 
 
@@ -183,6 +184,103 @@ const CARD_TEMPLATES = [
   },
 
   {
+    id: "email-footer-card",
+    label: "Email Footer",
+    icon: "📧",
+    hint: "Button + unsubscribe + phone/email + social icons + divider",
+    build: (x, y) => {
+      const W = 680;
+      const gId = crypto.randomUUID();
+      const fbSrc = "https://cdn-icons-png.flaticon.com/512/733/733547.png";
+      const twSrc = "https://cdn-icons-png.flaticon.com/512/733/733579.png";
+      const liSrc = "https://cdn-icons-png.flaticon.com/512/145/145807.png";
+      const centerX = x + W / 2;
+      return [
+        // Background card
+        { id: crypto.randomUUID(), groupId: gId, type: "rectangle",
+          x, y, width: W, height: 220,
+          backgroundColor: "radial-gradient(ellipse at center, #3d2817 0%, #1a0f08 50%, #0d0704 100%)",
+          borderRadius: 0, borderWidth: 0,
+          zIndex: Date.now() + 1 },
+        // CTA Button
+        { id: crypto.randomUUID(), groupId: gId, type: "button",
+          x: centerX - 140, y: y + 16, width: 280, height: 44,
+          content: "FIND YOUR VOICE NOW >",
+          fontSize: 14, fontWeight: "700",
+          color: "#ffffff", backgroundColor: "#c2831f",
+          borderRadius: 24,
+          fontFamily: "Arial, sans-serif", textAlign: "center",
+          link: "#", rotation: 0, opacity: 1, zIndex: Date.now() + 2 },
+        // Network text
+        { id: crypto.randomUUID(), groupId: gId, type: "paragraph",
+          x: x + 20, y: y + 72, width: W - 40, height: 24,
+          content: "You are receiving this email because you are part of our professional network.",
+          fontSize: 12, fontWeight: "normal",
+          color: "#d4c9b0", backgroundColor: "transparent",
+          fontFamily: "Arial, sans-serif", textAlign: "center",
+          lineHeight: 1.5, rotation: 0, opacity: 1, zIndex: Date.now() + 3 },
+        // Unsubscribe
+        { id: crypto.randomUUID(), groupId: gId, type: "heading",
+          x: centerX - 60, y: y + 96, width: 120, height: 24,
+          content: "Unsubscribe",
+          fontSize: 13, fontWeight: "700",
+          color: "#c2831f", backgroundColor: "transparent",
+          fontFamily: "Arial, sans-serif", textAlign: "center",
+          rotation: 0, opacity: 1, zIndex: Date.now() + 4 },
+        // Divider line 1
+        { id: crypto.randomUUID(), groupId: gId, type: "line",
+          x: x + 20, y: y + 128, width: W - 40, height: 1,
+          strokeColor: "#3d2e10", strokeWidth: 1,
+          rotation: 0, opacity: 1, zIndex: Date.now() + 5 },
+        // Phone
+        { id: crypto.randomUUID(), groupId: gId, type: "paragraph",
+          x: x + 60, y: y + 136, width: 200, height: 24,
+          content: "📞  301-467-4900",
+          fontSize: 13, fontWeight: "normal",
+          color: "#4da6ff", backgroundColor: "transparent",
+          fontFamily: "Arial, sans-serif", textAlign: "right",
+          lineHeight: 1.4, rotation: 0, opacity: 1, zIndex: Date.now() + 6 },
+        // Pipe separator
+        { id: crypto.randomUUID(), groupId: gId, type: "paragraph",
+          x: centerX - 6, y: y + 136, width: 12, height: 24,
+          content: "|",
+          fontSize: 14, fontWeight: "normal",
+          color: "#6b5a3a", backgroundColor: "transparent",
+          fontFamily: "Arial, sans-serif", textAlign: "center",
+          lineHeight: 1.4, rotation: 0, opacity: 1, zIndex: Date.now() + 7 },
+        // Email
+        { id: crypto.randomUUID(), groupId: gId, type: "paragraph",
+          x: centerX + 10, y: y + 136, width: 240, height: 24,
+          content: "info@producersnandyandy.com",
+          fontSize: 13, fontWeight: "normal",
+          color: "#4da6ff", backgroundColor: "transparent",
+          fontFamily: "Arial, sans-serif", textAlign: "left",
+          lineHeight: 1.4, rotation: 0, opacity: 1, zIndex: Date.now() + 8 },
+        // Facebook
+        { id: crypto.randomUUID(), groupId: gId, type: "social",
+          platform: "Facebook", src: fbSrc,
+          x: centerX - 72, y: y + 168, width: 36, height: 36,
+          link: "#", rotation: 0, opacity: 1, zIndex: Date.now() + 9 },
+        // Twitter
+        { id: crypto.randomUUID(), groupId: gId, type: "social",
+          platform: "Twitter", src: twSrc,
+          x: centerX - 18, y: y + 168, width: 36, height: 36,
+          link: "#", rotation: 0, opacity: 1, zIndex: Date.now() + 10 },
+        // LinkedIn
+        { id: crypto.randomUUID(), groupId: gId, type: "social",
+          platform: "LinkedIn", src: liSrc,
+          x: centerX + 36, y: y + 168, width: 36, height: 36,
+          link: "#", rotation: 0, opacity: 1, zIndex: Date.now() + 11 },
+        // Gold bottom divider
+        { id: crypto.randomUUID(), groupId: gId, type: "line",
+          x: x + 20, y: y + 214, width: W - 40, height: 2,
+          strokeColor: "#c2831f", strokeWidth: 2,
+          rotation: 0, opacity: 1, zIndex: Date.now() + 12 },
+      ];
+    },
+  },
+
+  {
   id:"why-choose-left-card",
   label:"Why Choose Card (Image Left)",
   icon:"🖼",
@@ -266,13 +364,41 @@ export default function ToolsPanel({
   }, [emojiSearch, emojiCat]);
 
   // ── handlers ──
-  const handleFileUpload = (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
+const handleFileUpload = async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  // Convert to base64
+  const base64 = await new Promise((resolve) => {
     const reader = new FileReader();
-    reader.onload = () => addElement("image", { src:reader.result });
+    reader.onload = () => resolve(reader.result);
     reader.readAsDataURL(file);
-  };
+  });
+
+  try {
+    const token = localStorage.getItem("token");
+    const res = await fetch(`${import.meta.env.VITE_VRI_URL}/api/upload/snapshot`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ imageBase64: base64 }),
+    });
+
+    const data = await res.json();
+    if (res.ok && data.url) {
+      addElement("image", { src: data.url }); // ✅ https:// URL stored
+    } else {
+      // Fallback: use data URL only for canvas preview (won't work in email)
+      console.warn("Image upload failed, using local preview only");
+      addElement("image", { src: base64 });
+    }
+  } catch (err) {
+    console.error("Image upload error:", err);
+    addElement("image", { src: base64 }); // fallback
+  }
+};
 
   const handleUrlAdd = () => {
     if (urlInput.trim()) { addElement("image", { src:urlInput.trim() }); setUrlInput(""); }
@@ -284,6 +410,15 @@ export default function ToolsPanel({
     const elements = card.build(x, y);
     if (addMultipleElements) addMultipleElements(elements);
     else elements.forEach(el => addElement(el.type, el));
+  };
+
+  const handleAddList = (kind) => {
+    addElement("paragraph", {
+      content: newListContent(kind),
+      width:   360,
+      height:  110,          // three items need more room than a one-line paragraph
+      textAlign: "left",
+    });
   };
 
   const handleAddHeading = (h) => {
@@ -366,7 +501,7 @@ export default function ToolsPanel({
                   <div style={{
                     position:"absolute", top:"calc(100% + 4px)", left:0, right:0, zIndex:100,
                     background:T.panel, border:`1px solid ${T.gold}55`, borderRadius:9,
-                    boxShadow:`0 8px 28px rgba(0,0,0,.7)`, overflow:"hidden",
+                    boxShadow:`0 8px 28px ${T.canvasEdge}`, overflow:"hidden",
                   }}>
                     {HEADING_TAGS.map(h => (
                       <button key={h.tag}
@@ -408,12 +543,34 @@ export default function ToolsPanel({
               </div>
             </div>
 
+            {/* ── Lists ── */}
+            <div style={{ marginBottom:16 }}>
+              <SLabel>☰  Lists</SLabel>
+              <div style={{ fontSize:10, color:T.muted, marginBottom:6, lineHeight:1.5 }}>
+                Adds a list block. Double-click it to edit the items.
+              </div>
+              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:7 }}>
+                {[
+                  { label:"Bullet",  kind:"bullet", icon:"•",  hint:"Bulleted list" },
+                  { label:"Numbered",kind:"number", icon:"1.", hint:"1. 2. 3." },
+                  { label:"Roman",   kind:"roman",  icon:"I.", hint:"I. II. III." },
+                ].map(item => (
+                  <ElementChip key={item.kind} item={item} onClick={() => handleAddList(item.kind)} />
+                ))}
+              </div>
+            </div>
+
             <div style={{ marginBottom:16 }}>
               <SLabel>◆  Shapes</SLabel>
+              <div style={{ fontSize:10, color:T.muted, marginBottom:6, lineHeight:1.5 }}>
+                Double-click a shape to type inside it. Borders and image fill are in Properties.
+              </div>
               <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:7 }}>
                 {[
-                  { label:"Rectangle", type:"rectangle", icon:"▭", hint:"Box / block" },
+                  { label:"Rectangle", type:"rectangle", icon:"▭", hint:"Text or image box" },
+                  // { label:"Square",    type:"square",    icon:"◼", hint:"Text or image box" },
                   { label:"Circle",    type:"circle",    icon:"●", hint:"Round badge" },
+                  // { label:"Triangle",  type:"triangle",  icon:"▲", hint:"Text or image box" },
                   { label:"Star",      type:"star",      icon:"★", hint:"Accent / rating" },
                   { label:"Line",      type:"line",      icon:"─", hint:"Divider" },
                 ].map(item => (

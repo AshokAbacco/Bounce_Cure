@@ -2,8 +2,26 @@
 
 import sgMail from "@sendgrid/mail";
 import { prisma } from "../prisma/prismaClient.js";
+import { sendCampaignMessage } from "./campaignTransport.js";
 
-sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+// ✅ Dedicated SendGrid client — the shared `sgMail` object gets its key
+// overwritten by other files (mailer.js, emailService.js, imapSync.js),
+// which made scheduled campaigns go out from the wrong SendGrid account
+// ("no IPs are available for this account"). Same key + pool as campaigns.js.
+const campaignMailer = new sgMail.MailService();
+let campaignMailerKey = null;
+
+async function sendCampaignMail(msg) {
+  // Read env lazily: server.js calls dotenv.config() after imports load.
+  const key = process.env.SENDGRID_CAMPAIGN_API_KEY || process.env.SENDGRID_API_KEY;
+  if (!key) throw new Error("SendGrid campaign API key not configured");
+  if (key !== campaignMailerKey) {
+    campaignMailer.setApiKey(key);
+    campaignMailerKey = key;
+  }
+  const pool = process.env.SENDGRID_IP_POOL;
+  return campaignMailer.send(pool ? { ...msg, ipPoolName: pool } : msg);
+}
 
 /* ==========================================================
    HTML + Plain Text Generators
@@ -129,6 +147,7 @@ async function sendCampaignEmails(campaign, recipients) {
 
   const results = { success: [], failed: [] };
   let actualSentCount = 0;
+  let stopReason = null;
 
   // Get user credits
   const payments = await prisma.payment.findMany({
@@ -168,6 +187,10 @@ async function sendCampaignEmails(campaign, recipients) {
   for (const r of recipients) {
     const toEmail = typeof r === "string" ? r : r.email;
     if (!toEmail) continue;
+    if (stopReason) {
+      results.failed.push({ email: toEmail, error: stopReason });
+      continue;
+    }
     if (actualSentCount >= availableCredits) {
       results.failed.push({ email: toEmail, error: "Insufficient credits" });
       continue;
@@ -179,10 +202,13 @@ async function sendCampaignEmails(campaign, recipients) {
       subject: campaign.subject,
       text: plainTextContent,
       html: htmlContent,
+      customArgs: { campaignId: campaign.id.toString() },
+      categories: [`campaign_${campaign.id}`],
     };
 
     try {
-      const response = await sgMail.send(msg);
+      // ✉️ Uses the method chosen in the From step (SENDGRID or SMTP)
+      const response = await sendCampaignMessage(campaign.sendMethod, msg, sendCampaignMail);
       if (response[0].statusCode >= 200 && response[0].statusCode < 300) {
         results.success.push({ email: toEmail });
         actualSentCount++;
@@ -191,6 +217,7 @@ async function sendCampaignEmails(campaign, recipients) {
       }
     } catch (err) {
       const msgErr = err.response?.body?.errors?.[0]?.message || err.message || "Unknown error";
+      if (err.stopCampaign) stopReason = msgErr; // quota / login: don't hammer the provider
       console.error(`❌ Failed to send to ${toEmail}:`, msgErr);
       results.failed.push({ email: toEmail, error: msgErr });
     }

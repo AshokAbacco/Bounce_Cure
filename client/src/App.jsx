@@ -26,7 +26,7 @@ import Support from './pages/Support/Support';
 import PricingDash from './pages/Pricing/PricingDash';
 import PaymentPage from './pages/Pricing/components/Checkout';
 import { UserProvider } from "./components/UserContext";
-import NewCampaignWindow from './pages/Campaign/Components/NewCampaignWindow';
+// import NewCampaignWindow from './pages/Campaign/Components/NewCampaignWindow';
 import CreateCampaign from './pages/Campaign/pages/CreateCampaign';
 import EditorPage from './pages/Campaign/pages/EditorPage';
 import PhoneValidation from './pages/PhoneValidation/PhoneValidation';
@@ -61,6 +61,7 @@ import CreditCardWrapper from './pages/Pricing/components/CreditCardWrapper'
 import ProtectedRoute from "./components/ProtectedRoute";
 import PlanProtectedRoute from "./components/PlanProtectedRoute"; // NEW - Plan-based protection
 import CampaignTextEditor from './pages/Campaign/Components/Editor/CampaignTextEditor';
+import TextTemplates from './pages/Campaign/pages/TextTemplates';
 import PrivacyPolicy from './pages/PrivacyPolicy';
 
 import OAuthOutlookCallback from './components/inbox/OAuthOutlookCallback';
@@ -140,7 +141,7 @@ function App() {
             <Route path='/phoneValidation' element={<ProtectedRoute><PhoneValidation /></ProtectedRoute>} />
             
             {/* Campaign Routes */}
-            <Route path='/new-campaign' element={<ProtectedRoute><NewCampaignWindow /></ProtectedRoute>} />
+            {/* <Route path='/new-campaign' element={<ProtectedRoute><NewCampaignWindow /></ProtectedRoute>} /> */}
             <Route path="/create" element={<ProtectedRoute><CreateCampaign /></ProtectedRoute>} />
             <Route path="/editor" element={<ProtectedRoute><EditorPage /></ProtectedRoute>} />
             <Route path="/templetes" element={<ProtectedRoute><Templets /></ProtectedRoute>} />
@@ -148,6 +149,7 @@ function App() {
             <Route path="/send-campaign" element={<ProtectedRoute><SendCampaign /></ProtectedRoute>} />
             <Route path="/all-templates" element={<ProtectedRoute><AllTemplates /></ProtectedRoute>} />
             <Route path="/texteditor" element={<ProtectedRoute><CampaignTextEditor /></ProtectedRoute>} />
+            <Route path="/text-templates" element={<ProtectedRoute><TextTemplates /></ProtectedRoute>} />
             <Route path="/verifydemail" element={<ProtectedRoute><VerifydEmail /></ProtectedRoute>} />
             <Route path="/verify-email" element={<ProtectedRoute><VerifyEmail /></ProtectedRoute>} />
             
@@ -155,7 +157,6 @@ function App() {
             <Route path="/MultimediaCampaigns" element={<ProtectedRoute><MultimediaCampaign /></ProtectedRoute>} />
             <Route path="/whatsapp" element={<ProtectedRoute><WhatsappCampaign /></ProtectedRoute>} />
             <Route path="/sms" element={<ProtectedRoute><SMScampaign /></ProtectedRoute>} />
-            <Route path="/texteditor" element={<ProtectedRoute><CampaignTextEditor /></ProtectedRoute>} />
 
             <Route path="/oauth/outlook/callback" element={<OAuthOutlookCallback />} />
             <Route path="/twilio-setup" element={<TwilioSetupPage />} />

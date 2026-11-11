@@ -2,6 +2,7 @@
 import cron from "node-cron";
 import sgMail from "@sendgrid/mail";
 import { prisma } from "../prisma/prismaClient.js";
+import { sendCampaignMessage } from "../services/campaignTransport.js";
 
 sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
@@ -361,11 +362,16 @@ async function processScheduledCampaigns() {
         // Send emails
         const results = { success: [], failed: [] };
         let actualSentCount = 0;
+        let stopReason = null;
 
         for (const recipient of recipients) {
           const toEmail = typeof recipient === "string" ? recipient : recipient.email;
           if (!toEmail) continue;
 
+          if (stopReason) {
+            results.failed.push({ email: toEmail, error: stopReason });
+            continue;
+          }
           if (actualSentCount >= availableCredits) {
             results.failed.push({ email: toEmail, error: "Credit limit reached" });
             break;
@@ -380,7 +386,8 @@ async function processScheduledCampaigns() {
           };
 
           try {
-            const response = await sgMail.send(msg);
+            // ✉️ Uses the method chosen in the From step (SENDGRID or SMTP)
+            const response = await sendCampaignMessage(campaign.sendMethod, msg, (m) => sgMail.send(m));
             if (response[0].statusCode >= 200 && response[0].statusCode < 300) {
               results.success.push({ email: toEmail });
               actualSentCount++;
@@ -393,6 +400,7 @@ async function processScheduledCampaigns() {
           } catch (err) {
             const msgErr = err.response?.body?.errors?.[0]?.message || err.message;
             console.error(`❌ Failed to send to ${toEmail}:`, msgErr);
+            if (err.stopCampaign) stopReason = msgErr; // quota / login: stop hitting the provider
             results.failed.push({ email: toEmail, error: msgErr });
           }
 
