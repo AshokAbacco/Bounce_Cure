@@ -9,16 +9,15 @@
 // calls sendCampaignMessage() with it, so one campaign never mixes
 // providers.
 //
-// SMTP credentials come ONLY from the server .env:
-//   SMTP_HOST / EMAIL_HOST      e.g. smtp.gmail.com
-//   SMTP_PORT / EMAIL_PORT      587 (STARTTLS) or 465 (SSL)
-//   SMTP_SECURE / EMAIL_SECURE  "true" for 465 (auto from port if unset)
-//   SMTP_USER / EMAIL_USER      login
-//   SMTP_PASS / EMAIL_PASS      password / Gmail app password
-//   SMTP_FROM_EMAIL             optional; defaults to the login (Gmail rewrites other From addresses)
-//   SMTP_DAILY_LIMIT            optional; default 450 (personal Gmail ≈ 500 recipients / 24h)
-// SMTP_* wins over EMAIL_*, so you can move campaigns to another SMTP
-// provider without affecting other app mail that uses EMAIL_*.
+// SMTP credentials come ONLY from the server .env, and ONLY from SMTP_*
+// (EMAIL_* stays for invoices etc. and is never used for campaigns):
+//   SMTP_HOST         e.g. smtppro.zoho.in (Zoho, domain mailbox)
+//   SMTP_PORT         465 (SSL) or 587 (STARTTLS)
+//   SMTP_SECURE       "true" for 465 (auto from port if unset)
+//   SMTP_USER         mailbox login, e.g. info@bouncecure.com
+//   SMTP_PASS         password / app password
+//   SMTP_FROM_EMAIL   optional; defaults to SMTP_USER (must be that mailbox or its alias)
+//   SMTP_DAILY_LIMIT  optional; default 200
 // ================================================================
 import nodemailer from "nodemailer";
 import { prisma } from "../prisma/prismaClient.js";
@@ -52,19 +51,25 @@ export function resolveSendMethod(requested, user) {
 const truthy = (v) => ["1", "true", "yes", "on"].includes(String(v ?? "").trim().toLowerCase());
 
 export function getSmtpSettings(env = process.env) {
-  const host   = (env.SMTP_HOST || env.EMAIL_HOST || "").trim();
-  const port   = Number(env.SMTP_PORT || env.EMAIL_PORT || 587);
-  const secureRaw = env.SMTP_SECURE ?? env.EMAIL_SECURE;
+  const host   = (env.SMTP_HOST || "").trim();
+  const port   = Number(env.SMTP_PORT || 587);
+  const secureRaw = env.SMTP_SECURE;
   const secure = secureRaw === undefined || secureRaw === "" ? port === 465 : truthy(secureRaw);
-  const user   = (env.SMTP_USER || env.EMAIL_USER || "").trim();
-  let   pass   = env.SMTP_PASS || env.EMAIL_PASS || "";
+  const user   = (env.SMTP_USER || "").trim();
+  let   pass   = env.SMTP_PASS || "";
   const isGmail = /(^|\.)(gmail|googlemail)\.com$/i.test(host);
+  const providerName =
+    /(^|\.)zoho\./i.test(host)          ? "Zoho Mail SMTP" :
+    isGmail                              ? "Gmail SMTP" :
+    /brevo|sendinblue/i.test(host)       ? "Brevo SMTP" :
+    /office365|outlook/i.test(host)      ? "Outlook SMTP" :
+    host || "SMTP";
   if (isGmail) pass = pass.replace(/\s+/g, ""); // Gmail shows app passwords as "abcd efgh ijkl mnop"
   const limit = Number(env.SMTP_DAILY_LIMIT);
   return {
-    host, port, secure, user, pass, isGmail,
+    host, port, secure, user, pass, isGmail, providerName,
     fromEmail:  (env.SMTP_FROM_EMAIL || user).trim(),
-    dailyLimit: Number.isFinite(limit) && limit > 0 ? limit : 450,
+    dailyLimit: Number.isFinite(limit) && limit > 0 ? limit : 200,
     configured: Boolean(host && port && user && pass),
   };
 }
@@ -155,7 +160,7 @@ export async function getSendMethodsFor(user) {
       id: "SMTP",
       label: "SMTP",
       configured: cfg.configured,
-      provider: cfg.isGmail ? "Gmail SMTP" : cfg.host || "SMTP",
+      provider: cfg.providerName,
       host: cfg.host,
       port: cfg.port,
       encryption: cfg.secure ? "SSL/TLS" : "STARTTLS",
@@ -186,7 +191,7 @@ export async function sendCampaignMessage(method, msg, sendgridSend) {
 
   const cfg = getSmtpSettings();
   if (!cfg.configured) {
-    const e = new Error("SMTP is not configured on the server (EMAIL_HOST / EMAIL_PORT / EMAIL_USER / EMAIL_PASS).");
+    const e = new Error("SMTP is not configured on the server (SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS).");
     e.stopCampaign = true;
     throw e;
   }
@@ -221,7 +226,7 @@ export async function sendCampaignMessage(method, msg, sendgridSend) {
     await releaseSmtpSlot();
     if (isSmtpStopError(err)) err.stopCampaign = true;
     if (err.code === "EAUTH") {
-      err.message = "SMTP login failed. Check EMAIL_USER / EMAIL_PASS (Gmail needs a 16-character app password).";
+      err.message = "SMTP login failed. Check SMTP_USER / SMTP_PASS in the server .env (Zoho needs an app password when 2FA is on, and SMTP access enabled).";
     }
     throw err;
   }
