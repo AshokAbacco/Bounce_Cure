@@ -2,6 +2,7 @@
 
 import sgMail from "@sendgrid/mail";
 import { prisma } from "../prisma/prismaClient.js";
+import { sendCampaignMessage } from "./campaignTransport.js";
 
 // ✅ Dedicated SendGrid client — the shared `sgMail` object gets its key
 // overwritten by other files (mailer.js, emailService.js, imapSync.js),
@@ -146,6 +147,7 @@ async function sendCampaignEmails(campaign, recipients) {
 
   const results = { success: [], failed: [] };
   let actualSentCount = 0;
+  let stopReason = null;
 
   // Get user credits
   const payments = await prisma.payment.findMany({
@@ -185,6 +187,10 @@ async function sendCampaignEmails(campaign, recipients) {
   for (const r of recipients) {
     const toEmail = typeof r === "string" ? r : r.email;
     if (!toEmail) continue;
+    if (stopReason) {
+      results.failed.push({ email: toEmail, error: stopReason });
+      continue;
+    }
     if (actualSentCount >= availableCredits) {
       results.failed.push({ email: toEmail, error: "Insufficient credits" });
       continue;
@@ -201,7 +207,8 @@ async function sendCampaignEmails(campaign, recipients) {
     };
 
     try {
-      const response = await sendCampaignMail(msg);
+      // ✉️ Uses the method chosen in the From step (SENDGRID or SMTP)
+      const response = await sendCampaignMessage(campaign.sendMethod, msg, sendCampaignMail);
       if (response[0].statusCode >= 200 && response[0].statusCode < 300) {
         results.success.push({ email: toEmail });
         actualSentCount++;
@@ -210,6 +217,7 @@ async function sendCampaignEmails(campaign, recipients) {
       }
     } catch (err) {
       const msgErr = err.response?.body?.errors?.[0]?.message || err.message || "Unknown error";
+      if (err.stopCampaign) stopReason = msgErr; // quota / login: don't hammer the provider
       console.error(`❌ Failed to send to ${toEmail}:`, msgErr);
       results.failed.push({ email: toEmail, error: msgErr });
     }

@@ -22,6 +22,9 @@ model User {
   isVerified    Boolean  @default(false)
   updatedAt     DateTime @updatedAt
 
+  // 🔐 Access role — ADMIN can send campaigns via SMTP or SendGrid, USER via SendGrid only
+  role UserRole @default(USER)
+
   // New fields
   plan               String  @default("Free")
   hasPurchasedBefore Boolean @default(false)
@@ -556,6 +559,9 @@ model Campaign {
   pending      Int?    @default(0) // Emails not yet sent
   snapshotUrl  String? @db.Text // Pixel-perfect email snapshot URL
 
+  // ✉️ Provider chosen in the From step; used for the whole campaign (incl. scheduled/resumed sends)
+  sendMethod CampaignSendMethod @default(SENDGRID)
+
   user          User            @relation(fields: [userId], references: [id], onDelete: Cascade)
   events        CampaignEvent[]
   AutomationLog AutomationLog[]
@@ -783,6 +789,23 @@ enum Sender {
   USER
   ADMIN
   BOT
+}
+
+enum UserRole {
+  ADMIN
+  USER
+}
+
+enum CampaignSendMethod {
+  SENDGRID
+  SMTP
+}
+
+// Per-day counter of campaign emails sent through SMTP (free SMTP providers cap daily volume)
+model SmtpDailyUsage {
+  day       String   @id // "YYYY-MM-DD" (UTC)
+  count     Int      @default(0)
+  updatedAt DateTime @updatedAt
 }
 
 model UserUpload {

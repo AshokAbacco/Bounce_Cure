@@ -3,6 +3,13 @@ import express from "express";
 import sgMail from "@sendgrid/mail";
 import { prisma } from "../prisma/prismaClient.js";
 import { protect } from "../middleware/authMiddleware.js";
+import {
+  sendCampaignMessage,
+  resolveSendMethod,
+  getSmtpSettings,
+  getSmtpUsage,
+  getSendMethodsFor,
+} from "../services/campaignTransport.js";
 
 // ================================================================
 // 📮 DEDICATED SENDGRID CLIENT FOR CAMPAIGNS
@@ -75,10 +82,12 @@ export async function resumeStuckCampaigns() {
 }
 
 async function _sendInBatches(campaign, buildMessage) {
-  if (!initCampaignMailer()) {
+  const sendMethod = campaign.sendMethod || "SENDGRID";
+  if (sendMethod === "SENDGRID" && !initCampaignMailer()) {
     console.error(`❌ Campaign ${campaign.id}: SendGrid campaign API key not configured`);
-    return;
+    return { stopped: true, reason: "SendGrid campaign API key not configured" };
   }
+  let stopReason = null; // set when the provider says "stop" (SMTP quota / login failure)
 
   let recipients = [];
   try { recipients = JSON.parse(campaign.recipientsJson || "[]"); } catch { return; }
@@ -90,7 +99,7 @@ async function _sendInBatches(campaign, buildMessage) {
   const startBatch = Math.max(1, campaign.currentBatch || 1);
   let   totalSent  = campaign.sentCount || 0;
 
-  console.log(`🚀 Campaign ${campaign.id} | ${totalRecipients} recipients | ${totalBatches} batches | Starting at batch ${startBatch}`);
+  console.log(`🚀 Campaign ${campaign.id} | via ${sendMethod} | ${totalRecipients} recipients | ${totalBatches} batches | Starting at batch ${startBatch}`);
 
   // ── Initialize batch metadata in DB ───────────────────────────
   await prisma.campaign.update({
@@ -148,7 +157,7 @@ const delayPerEmail = batchCount < 50
           };
 
       try {
-        const response = await sendCampaignMail(msg);
+        const response = await sendCampaignMessage(sendMethod, msg, sendCampaignMail);
         if (response[0].statusCode >= 200 && response[0].statusCode < 300) {
           batchSent++;
           totalSent++;
@@ -157,6 +166,12 @@ const delayPerEmail = batchCount < 50
           console.error(`⚠️  Status ${response[0].statusCode} for ${toEmail}`);
         }
       } catch (e) {
+        if (e.stopCampaign) {
+          // Quota / login problem: every remaining email would fail the same way. Stop here.
+          stopReason = e.message;
+          console.error(`⛔ Campaign ${campaign.id} stopped (${sendMethod}): ${e.message}`);
+          break;
+        }
         batchFailed++;
         console.error(`❌ ${toEmail}:`, e.response?.body?.errors?.[0]?.message || e.message);
       }
@@ -189,6 +204,24 @@ const delayPerEmail = batchCount < 50
 
     console.log(`✅ Batch ${batchNum}/${totalBatches} done | sent: ${batchSent} | failed: ${batchFailed} | totalSent: ${totalSent}`);
 
+    if (stopReason) {
+      await prisma.campaign.update({
+        where: { id: campaign.id },
+        data:  { sentCount: totalSent, pending: totalRecipients - totalSent, status: "paused" },
+      });
+      await prisma.automationLog.create({
+        data: {
+          userId:       campaign.userId,
+          campaignId:   campaign.id,
+          campaignName: campaign.name || campaign.subject,
+          status:       "paused",
+          message:      `Stopped after ${totalSent}/${totalRecipients} emails via ${sendMethod}`,
+          error:        stopReason,
+        },
+      }).catch(() => {});
+      return { stopped: true, reason: stopReason, sent: totalSent };
+    }
+
     // 5s pause between batches
     if (batchNum < totalBatches) {
       console.log(`⏸  Pausing 5s before batch ${batchNum + 1}…`);
@@ -208,6 +241,7 @@ const delayPerEmail = batchCount < 50
   });
 
   console.log(`🎉 Campaign ${campaign.id} COMPLETE | ${totalSent}/${totalRecipients} sent across ${totalBatches} batch(es)`);
+  return { stopped: false, sent: totalSent };
 }
 // In server/routes/campaigns.js, replace the entire generateHtmlFromCanvas function with this updated version
 
@@ -1029,14 +1063,27 @@ router.get("/credits", async (req, res) => {
   }
 });
 
+// ✉️ Sending methods for the From step. USER → SendGrid only, ADMIN → SendGrid + SMTP.
+// Returns account details for display only; SMTP passwords are never sent.
+router.get("/send-methods", async (req, res) => {
+  try {
+    res.json({ success: true, ...(await getSendMethodsFor(req.user)) });
+  } catch (error) {
+    console.error("❌ Error fetching send methods:", error);
+    res.status(500).json({ success: false, error: "Failed to load sending methods" });
+  }
+});
+
 router.post("/send", async (req, res) => {
   try {
     console.log("📨 /api/campaigns/send called by user:", req.user?.id);
 
     // ✅ STEP 0: Destructure FIRST before using any variables
+    let {
+      fromEmail,
+    } = req.body;
     const {
       recipients,
-      fromEmail,
       fromName,
       fromAddress,
       replyToEmail,
@@ -1052,6 +1099,37 @@ router.post("/send", async (req, res) => {
       recurringDays,
       recurringEndDate,
     } = req.body;
+
+    // ✉️ Sending method: role-checked on the server (USER can only use SendGrid)
+    let sendMethod;
+    try {
+      sendMethod = resolveSendMethod(req.body.sendMethod, req.user);
+    } catch (e) {
+      return res.status(e.status || 400).json({ error: e.message });
+    }
+
+    if (sendMethod === "SMTP") {
+      const smtp = getSmtpSettings();
+      if (!smtp.configured) {
+        return res.status(400).json({ error: "SMTP is not configured on the server." });
+      }
+      // SMTP always sends from the configured account; the typed address becomes Reply-To.
+      fromEmail = smtp.fromEmail;
+
+      const count = Array.isArray(recipients) ? recipients.length : 0;
+      if ((scheduleType || "immediate") === "immediate") {
+        const usage = await getSmtpUsage();
+        if (count > usage.remaining) {
+          return res.status(400).json({
+            error: `SMTP can send ${usage.remaining} more email(s) today (limit ${usage.dailyLimit}). You selected ${count}. Reduce recipients or use SendGrid.`,
+          });
+        }
+      } else if (count > smtp.dailyLimit) {
+        return res.status(400).json({
+          error: `SMTP daily limit is ${smtp.dailyLimit} emails. You selected ${count}. Reduce recipients or use SendGrid.`,
+        });
+      }
+    }
 
     // Merge background color as sentinel into canvasData
     const canvasData = _bg
@@ -1107,9 +1185,9 @@ router.post("/send", async (req, res) => {
     }
 
     // ==========================================================
-    // 🧠 STEP 2: SendGrid setup
+    // 🧠 STEP 2: SendGrid setup (only needed when sending via SendGrid)
     // ==========================================================
-    if (!initCampaignMailer()) {
+    if (sendMethod === "SENDGRID" && !initCampaignMailer()) {
       return res.status(500).json({ error: "SendGrid API key not configured" });
     }
 
@@ -1151,10 +1229,11 @@ router.post("/send", async (req, res) => {
         status:            scheduleType === "immediate" ? "sending" : "scheduled",
         totalBatches: totalBatches,
         currentBatch: 1,
+        sendMethod,
       },
     });
 
-    console.log(`✅ Campaign ${campaign.id} created | recipients: ${recipients.length} | batches: ${totalBatches} | scheduleType: ${scheduleType}`);
+    console.log(`✅ Campaign ${campaign.id} created | via ${sendMethod} | recipients: ${recipients.length} | batches: ${totalBatches} | scheduleType: ${scheduleType}`);
 
     // ==========================================================
     // 🕒 STEP 5: If scheduled or recurring → Save & return early
@@ -1258,6 +1337,7 @@ router.post("/send", async (req, res) => {
         ? `🚀 Campaign started! ${recipients.length.toLocaleString()} emails split into ${totalBatches} batch(es) of ${BATCH_SIZE.toLocaleString()}. Estimated ~${estimatedMinutes} min total.`
         : `🚀 Campaign started! Sending ${recipients.length.toLocaleString()} emails now…`,
       campaignId:      campaign.id,
+      sendMethod,
       recipientCount:  recipients.length,
       batchTotal:      totalBatches,
       batchSize:       BATCH_SIZE,
@@ -1286,7 +1366,7 @@ router.post("/send", async (req, res) => {
 
     // ── Launch batch engine in background (non-blocking) ────────
     _sendInBatches(campaign, buildMessage)
-      .then(async () => {
+      .then(async (outcome) => {
         // =======================================================
         // 💰 STEP 7: Deduct credits once ALL batches complete
         // =======================================================
@@ -1334,7 +1414,8 @@ router.post("/send", async (req, res) => {
 
         console.log(`✅ Credits updated — user.emailLimit now ${finalUserEmailLimit}`);
 
-        // 3️⃣ Log completion
+        // 3️⃣ Log completion (a stopped campaign already logged itself as "paused")
+        if (outcome?.stopped) return;
         await prisma.automationLog.create({
           data: {
             userId:       req.user.id,

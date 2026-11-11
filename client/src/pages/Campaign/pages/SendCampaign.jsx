@@ -4,7 +4,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import {
   CheckCircle, ChevronDown, ChevronUp, Send, Users, Settings,
   FileText, Check, Clock, Calendar, AlertCircle,
-  Mail, RefreshCw, LogOut
+  Mail, RefreshCw, LogOut, Server, Lock
 } from "lucide-react";
 import ShuffleSubjectModal from "../Components/ShuffleSubjectModal";
 import { Shuffle } from "lucide-react";
@@ -316,6 +316,7 @@ export default function CampaignBuilder() {
   const [expanded,       setExpanded]       = useState("setup");
   const [completedSteps, setCompletedSteps] = useState([]);
   const [formData,       setFormData]       = useState({
+    sendMethod:        "SENDGRID",   // ✉️ SENDGRID | SMTP (SMTP is admin-only)
     recipients:        "",
     fromEmail:         "",
     fromName:          "",
@@ -353,6 +354,12 @@ export default function CampaignBuilder() {
   const [isDragging,               setIsDragging]               = useState(false);
 
   const getAuthToken = () => localStorage.getItem("token");
+
+  // ✉️ Sending methods allowed for this user (USER → SendGrid, ADMIN → SendGrid + SMTP)
+  const [sendMethods, setSendMethods] = useState({ isAdmin:false, methods:[{ id:"SENDGRID", label:"SendGrid", configured:true }] });
+  const smtpMethod     = sendMethods.methods.find(m => m.id === "SMTP");
+  const sendgridMethod = sendMethods.methods.find(m => m.id === "SENDGRID");
+  const isSmtp         = formData.sendMethod === "SMTP";
   const [batchProgress, setBatchProgress] = useState({
     campaignId: null,
     batchCurrent: 0,
@@ -473,6 +480,32 @@ useEffect(() => {
     load();
   }, []);
 
+  /* ── fetch allowed sending methods (role-based) ────────── */
+  const loadSendMethods = async () => {
+    try {
+      const res = await fetch(`${API_URL}/api/campaigns/send-methods`, {
+        headers: { Authorization: `Bearer ${getAuthToken()}` },
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data?.methods?.length) setSendMethods(data);
+    } catch { /* keep SendGrid-only default */ }
+  };
+  useEffect(() => { loadSendMethods(); }, []);
+
+  const selectSendMethod = (method) => {
+    if (method === formData.sendMethod) return;
+    if (method === "SMTP" && !smtpMethod) return; // not allowed for this role
+    setFormData(prev => ({
+      ...prev,
+      sendMethod: method,
+      // SMTP sends from the configured server account; SendGrid needs a verified sender typed by the user
+      fromEmail:  method === "SMTP" ? (smtpMethod?.fromEmail || "") : "",
+    }));
+    setEmailVerificationStatus(null);
+    setCompletedSteps(prev => prev.filter(s => s !== "setup")); // re-confirm the From step
+  };
+
   /* ── helpers ────────────────────────────────────────────── */
   const getRecipientCount = () => {
     if (formData.recipients==="all-subscribers") return contacts.length;
@@ -522,7 +555,7 @@ useEffect(() => {
     } catch { setEmailVerificationStatus(false); }
     finally  { setIsCheckingEmail(false); }
   };
-  const handleEmailBlur = (e) => { if (e.target.name==="fromEmail") checkEmailVerification(e.target.value); };
+  const handleEmailBlur = (e) => { if (e.target.name==="fromEmail" && formData.sendMethod==="SENDGRID") checkEmailVerification(e.target.value); };
 
   /* ── pre-convert all cross-origin img srcs to base64 so html2canvas works ── */
   const convertImagesToBase64 = async (containerEl) => {
@@ -657,6 +690,10 @@ useEffect(() => {
         setSendStatus({ success:false, message:"❌ No valid recipients found." });
         setIsSending(false); return;
       }
+      if (formData.sendMethod==="SMTP" && smtpMethod && formData.scheduleType==="immediate" && recipientsList.length > (smtpMethod.remaining ?? Infinity)) {
+        setSendStatus({ success:false, message:`❌ SMTP can send ${smtpMethod.remaining} more email(s) today (limit ${smtpMethod.dailyLimit}). Reduce recipients or switch to SendGrid.` });
+        setIsSending(false); return;
+      }
       if (recipientsList.length > Number(credits)) {
         setSendStatus({ success:false, message:`❌ Need ${recipientsList.length} credits, have ${credits}.` });
         setIsSending(false); return;
@@ -670,6 +707,7 @@ useEffect(() => {
 
       // ── build payload ────────────────────────────────────
       const payload = {
+        sendMethod:          formData.sendMethod,   // ✉️ SENDGRID | SMTP (server re-checks the role)
         campaignName:        formData.subject,
         subject:             formData.subject,
         fromEmail:           formData.fromEmail,
@@ -1074,12 +1112,74 @@ useEffect(() => {
                       {/* ── FROM / SETUP ── */}
                       {id==="setup" && (
                         <div className="space-y-4">
+                          {/* ── Sending method ── */}
+                          <div>
+                            <label className="block text-sm font-medium text-gray-300 mb-2">Sending Method</label>
+                            <div className={`grid gap-3 ${smtpMethod ? "sm:grid-cols-2" : "grid-cols-1"}`}>
+                              {sendMethods.methods.map(m => {
+                                const active = formData.sendMethod === m.id;
+                                const Icon   = m.id === "SMTP" ? Server : Mail;
+                                return (
+                                  <button key={m.id} type="button" onClick={()=>selectSendMethod(m.id)}
+                                          disabled={!m.configured}
+                                          className={`flex items-start gap-3 text-left p-3 rounded-md border transition-colors ${
+                                            active ? "border-[#c2831f] bg-[#c2831f]/10" : "border-gray-700 bg-gray-800 hover:border-gray-500"
+                                          } ${!m.configured ? "opacity-50 cursor-not-allowed" : ""}`}>
+                                    <span className={`mt-0.5 w-4 h-4 rounded-full border-2 flex-shrink-0 ${active ? "border-[#c2831f] bg-[#c2831f]" : "border-gray-500"}`}/>
+                                    <div>
+                                      <div className="flex items-center gap-2 font-medium text-white">
+                                        <Icon size={16}/> {m.label}
+                                        {m.id === "SMTP" && <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-gray-700 text-gray-300">Admin</span>}
+                                      </div>
+                                      <div className="text-xs text-gray-400 mt-0.5">
+                                        {!m.configured ? "Not configured on the server"
+                                          : m.id === "SMTP" ? `${m.provider} · ${m.remaining ?? "—"} of ${m.dailyLimit ?? "—"} left today`
+                                          : "Send from your verified sender email"}
+                                      </div>
+                                    </div>
+                                  </button>
+                                );
+                              })}
+                            </div>
+
+                            {/* Account / configuration details for the selected method */}
+                            <div className="mt-3 p-3 bg-gray-800 rounded-md border border-gray-700 text-sm space-y-1">
+                              {isSmtp && smtpMethod ? (
+                                <>
+                                  <div className="flex justify-between"><span className="text-gray-400">Provider</span><span className="text-white">{smtpMethod.provider}</span></div>
+                                  <div className="flex justify-between"><span className="text-gray-400">Server</span><span className="text-white">{smtpMethod.host}:{smtpMethod.port}</span></div>
+                                  <div className="flex justify-between"><span className="text-gray-400">Encryption</span><span className="text-white flex items-center gap-1"><Lock size={12}/>{smtpMethod.encryption}</span></div>
+                                  <div className="flex justify-between"><span className="text-gray-400">Sending account</span><span className="text-white">{smtpMethod.fromEmail}</span></div>
+                                  <div className="flex justify-between"><span className="text-gray-400">Sent today</span><span className="text-white">{smtpMethod.usedToday} / {smtpMethod.dailyLimit}</span></div>
+                                  <div className="h-1.5 bg-gray-700 rounded mt-1">
+                                    <div className="h-1.5 bg-[#c2831f] rounded" style={{ width:`${Math.min(100, ((smtpMethod.usedToday||0)/(smtpMethod.dailyLimit||1))*100)}%` }}/>
+                                  </div>
+                                  {getRecipientCount() > (smtpMethod.remaining ?? Infinity) && (
+                                    <p className="text-xs text-red-400 pt-1">
+                                      {getRecipientCount()} recipients selected, but only {smtpMethod.remaining} SMTP emails are left today. Reduce recipients or use SendGrid.
+                                    </p>
+                                  )}
+                                  <p className="text-xs text-gray-500 pt-1">Emails are sent from this account. The Reply To email below receives replies. Credentials stay on the server.</p>
+                                </>
+                              ) : (
+                                <>
+                                  <div className="flex justify-between"><span className="text-gray-400">Provider</span><span className="text-white">SendGrid</span></div>
+                                  <div className="flex justify-between"><span className="text-gray-400">Sender</span><span className="text-white">{formData.fromEmail || "Enter a verified sender below"}</span></div>
+                                  <div className="flex justify-between"><span className="text-gray-400">Tracking</span><span className="text-white">Opens &amp; clicks</span></div>
+                                  {sendgridMethod && !sendgridMethod.configured && <p className="text-xs text-red-400 pt-1">SendGrid is not configured on the server.</p>}
+                                </>
+                              )}
+                            </div>
+                          </div>
+
                           <div>
                             <label className="block text-sm font-medium text-gray-300 mb-1">From Email Address</label>
                             <div className="relative">
                               <input type="email" name="fromEmail" required
                                      value={formData.fromEmail} onChange={handleChange} onBlur={handleEmailBlur}
-                                     className={`w-full bg-gray-800 border rounded-md px-3 py-2 pr-10 focus:outline-none focus:ring-2 text-white ${
+                                     readOnly={isSmtp}
+                                     title={isSmtp ? "SMTP sends from the server's configured account" : undefined}
+                                     className={`w-full bg-gray-800 border rounded-md px-3 py-2 pr-10 focus:outline-none focus:ring-2 text-white ${isSmtp ? "opacity-70 cursor-not-allowed " : ""}${
                                        emailVerificationStatus===true?"border-green-500 focus:ring-green-500":
                                        emailVerificationStatus===false?"border-red-500 focus:ring-red-500":
                                        "border-gray-700 focus:ring-[#c2831f]"}`}
@@ -1088,7 +1188,7 @@ useEffect(() => {
                               {!isCheckingEmail && emailVerificationStatus===true  && <div className="absolute right-3 top-1/2 -translate-y-1/2"><CheckCircle className="text-green-500" size={20}/></div>}
                               {!isCheckingEmail && emailVerificationStatus===false && <div className="absolute right-3 top-1/2 -translate-y-1/2"><AlertCircle className="text-red-500" size={20}/></div>}
                             </div>
-                            {emailVerificationStatus===true && (
+                            {!isSmtp && emailVerificationStatus===true && (
                               <div className="mt-2 p-3 bg-green-900/30 border border-green-700 rounded-md">
                                 <div className="flex items-start gap-2">
                                   <CheckCircle className="text-green-400 flex-shrink-0 mt-0.5" size={18}/>
@@ -1096,7 +1196,7 @@ useEffect(() => {
                                 </div>
                               </div>
                             )}
-                            {emailVerificationStatus===false && (
+                            {!isSmtp && emailVerificationStatus===false && (
                               <div className="mt-2 p-3 bg-red-900/30 border border-red-700 rounded-md">
                                 <div className="flex items-start gap-2">
                                   <AlertCircle className="text-red-400 flex-shrink-0 mt-0.5" size={18}/>
@@ -1142,14 +1242,14 @@ useEffect(() => {
                           <button
                             onClick={()=>{
                               if (!formData.fromEmail||!formData.fromName) return;
-                              if (emailVerificationStatus!==true) {
+                              if (!isSmtp && emailVerificationStatus!==true) {
                                 alert('Please use a verified email. Click "Request verification here" to verify.');
                                 return;
                               }
                               markComplete(id);
                             }}
-                            disabled={!formData.fromEmail||!formData.fromName||emailVerificationStatus!==true||isCheckingEmail}
-                            className={`mt-4 px-4 py-2 rounded-md ${!formData.fromEmail||!formData.fromName||emailVerificationStatus!==true||isCheckingEmail?"bg-gray-700 cursor-not-allowed text-gray-400":"bg-[#c2831f] hover:bg-[#d09025] text-white"}`}>
+                            disabled={!formData.fromEmail||!formData.fromName||(!isSmtp&&emailVerificationStatus!==true)||isCheckingEmail}
+                            className={`mt-4 px-4 py-2 rounded-md ${!formData.fromEmail||!formData.fromName||(!isSmtp&&emailVerificationStatus!==true)||isCheckingEmail?"bg-gray-700 cursor-not-allowed text-gray-400":"bg-[#c2831f] hover:bg-[#d09025] text-white"}`}>
                             {isCheckingEmail ? "Checking email…" : "Save and Continue"}
                           </button>
                         </div>
@@ -1287,6 +1387,7 @@ useEffect(() => {
                                                formData.recipients==="vip-clients"     ? `VIP Clients (${contacts.filter(c=>c.type==="vip-client").length})` :
                                                formData.recipients==="manual"           ? `Manual (${getRecipientCount()})` :
                                                formData.recipients==="file"             ? `File Upload (${getRecipientCount()})` : "Not selected"],
+                                ["Sending via", isSmtp ? `SMTP (${smtpMethod?.provider || "server"})` : "SendGrid"],
                                 ["From",       `${formData.fromName} <${formData.fromEmail}>`],
                                 ["Subject",    formData.subject||"Not set"],
                                 ["Template",   canvasPages[0]?.elements?.length ? "Canvas Design (snapshot)" : formData.template],
