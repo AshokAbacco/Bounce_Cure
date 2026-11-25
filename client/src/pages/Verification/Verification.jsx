@@ -72,7 +72,7 @@ const Verification = () => {
 
     const loadBulk = async () => {
       try {
-        const res = await axios.get(`${VRI_URL}/verification/batches?source=bulk`, {
+        const res = await axios.get(`${VRI_URL}/api/verification/batches?source=bulk`, {
           headers: { Authorization: `Bearer ${token}` },
         });
         console.log("Bulk batches response:", res.data);
@@ -85,7 +85,7 @@ const Verification = () => {
 
     const loadManual = async () => {
       try {
-        const res = await axios.get(`${VRI_URL}/verification/batches?source=manual`, {
+        const res = await axios.get(`${VRI_URL}/api/verification/batches?source=manual`, {
           headers: { Authorization: `Bearer ${token}` },
         });
         console.log("Manual batches response:", res.data);
@@ -131,7 +131,7 @@ const verifySingle = async () => {
   setLoadingSingle(true);
   try {
     const res = await axios.post(
-      `${VRI_URL}/verification/verify-single`,
+      `${VRI_URL}/api/verification/verify-single`,
       { email: singleEmail.trim() },
       { headers: { Authorization: `Bearer ${token}` } }
     );
@@ -188,7 +188,7 @@ const handleBulkUpload = async (e) => {
       }
 
       const res = await axios.post(
-        `${VRI_URL}/verification/verify-bulk`,
+        `${VRI_URL}/api/verification/verify-bulk`,
         { emails },
         { headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` } }
       );
@@ -249,7 +249,7 @@ const verifyManual = async () => {
     }
 
     const res = await axios.post(
-      `${VRI_URL}/verification/verify-manual`,
+      `${VRI_URL}/api/verification/verify-manual`,
       { text: pasteText },
       { headers: { Authorization: `Bearer ${token}` } }
     );
@@ -627,7 +627,7 @@ const verifyManual = async () => {
                           onClick={async (e) => {
                             e.stopPropagation();
                             try {
-                              const res = await axios.get(`${VRI_URL}/verification/batches/${b.id}/results`, {
+                              const res = await axios.get(`${VRI_URL}/api/verification/batches/${b.id}/results`, {
                                 headers: { Authorization: `Bearer ${token}` },
                               });
                               const results = res.data.results || [];

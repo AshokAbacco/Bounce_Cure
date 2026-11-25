@@ -17,7 +17,6 @@ import verifySettingsAuth from './middleware/settingsMiddleware.js';
 import dashboardCRM from './routes/dashboardCRM.js';
 import notificationsRoutes from "./routes/notificationsRoutes.js";
 import forgotPasswordRoutes from "./routes/forgotPasswordRoute.js";
-import advancedVerificationRoute from "./routes/advancedVerification.js";
 import passwordRoutes from "./routes/passwordRoutes.js";
 import contactCRMRoutes from "./routes/contactCRM.js";
 import sendContactsRoutes from "./routes/SendCampaignContact.js";
@@ -187,7 +186,6 @@ app.use('/api/razorpay', razorpayRoutes);
 app.use('/api/upi', upiRoutes);
 app.use('/api', creditcardRoutes);
 
-app.use("/api/verification", advancedVerificationRoute);
 app.use("/auth", forgotPasswordRoutes);
 app.use("/api/support", supportRoutes);
 app.use("/api/settings", verifySettingsAuth, settingsRoutes);
@@ -334,5 +332,3 @@ process.on("unhandledRejection", (err) => {
 server.listen(PORT, () => {
   console.log(`✅ Server started on port ${PORT}`);
 });
-
- 
