@@ -1,4 +1,3 @@
-
 //verificationRoutes.js
 import express from "express";
 import AdvancedVerifier from "./advancedVerification.js";
@@ -183,10 +182,12 @@ if (credits < emails.length) {
 
 // ✅ Deduct used credits
 const remaining = Math.max(credits - emails.length, 0);
-await prisma.payment.update({
-  where: { id: latest.id },
-  data: { emailVerificationCredits: remaining },
-});
+if (latest) {
+  await prisma.payment.update({
+    where: { id: latest.id },
+    data: { emailVerificationCredits: remaining },
+  });
+}
 await prisma.user.update({
   where: { id: userId },
   data: { contactLimit: remaining },
@@ -199,17 +200,37 @@ for (const email of emails) {
   results.push(r);
 }
 
-// ✅ Save batch
+// ✅ Count valid, invalid, risky (required fields on VerificationBatch)
+const validCount = results.filter((r) => r.status === "valid").length;
+const invalidCount = results.filter((r) => r.status === "invalid").length;
+const riskyCount = results.filter((r) => r.status === "risky").length;
+
+// ✅ Save batch (BatchResult.mx is a String column, so join the array)
 const batch = await prisma.verificationBatch.create({
   data: {
     source: "bulk",
     userId,
     total: results.length,
-    results: { create: results.map((r) => ({ ...r, userId })) },
+    validCount,
+    invalidCount,
+    riskyCount,
+    includeOnlyValid: false,
+    results: {
+      create: results.map((r) => ({
+        ...r,
+        userId,
+        mx: Array.isArray(r.mx) ? r.mx.join(", ") : r.mx ?? null,
+      })),
+    },
   },
 });
 
-res.json({ success: true, batchId: batch.id, results });
+res.json({
+  success: true,
+  batchId: batch.id,
+  results,
+  summary: { total: results.length, validCount, invalidCount, riskyCount },
+});
 
 
 
@@ -318,7 +339,7 @@ const invalidCount = results.filter((r) => r.status === "invalid").length;
 const riskyCount = results.filter((r) => r.status === "risky").length;
 
 // ✅ Save batch (convert mx to string)
-await prisma.verificationBatch.create({
+const batch = await prisma.verificationBatch.create({
   data: {
     source: "manual",
     userId,
@@ -339,6 +360,7 @@ await prisma.verificationBatch.create({
 
 res.json({
   success: true,
+  batchId: batch.id,
   results,
   summary: { total: results.length, validCount, invalidCount, riskyCount },
 });
@@ -407,6 +429,32 @@ router.get("/batches/:id/results", async (req, res) => {
   } catch (err) {
     console.error("[/batches/:id/results] ERROR", err);
     return res.status(500).json({ error: "Failed to load results" });
+  }
+});
+
+
+// Delete a batch (and its results, via onDelete: Cascade)
+router.delete("/batches/:id", async (req, res) => {
+  const userId = req.user?.id;
+  const batchId = parseInt(req.params.id, 10);
+
+  if (!userId) return res.status(401).json({ error: "Unauthorized" });
+  if (Number.isNaN(batchId)) return res.status(400).json({ error: "Invalid batch id" });
+
+  try {
+    // Only delete batches that belong to the current user
+    const { count } = await prisma.verificationBatch.deleteMany({
+      where: { id: batchId, userId },
+    });
+
+    if (count === 0) {
+      return res.status(404).json({ error: "Batch not found" });
+    }
+
+    return res.json({ success: true, id: batchId });
+  } catch (err) {
+    console.error("[DELETE /batches/:id] ERROR", err);
+    return res.status(500).json({ error: "Failed to delete batch" });
   }
 });
 

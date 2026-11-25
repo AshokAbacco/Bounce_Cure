@@ -41,6 +41,80 @@ const StatusPill = ({ status = "invalid", score = 0 }) => {
 
 const formatNumber = (n) => (typeof n === "number" ? n : 0);
 
+const authHeaders = () => ({ Authorization: `Bearer ${localStorage.getItem("token")}` });
+
+// DB stores mx as a comma-separated string; the API returns an array. Always use an array in the UI.
+const toMxArray = (mx) => {
+  if (Array.isArray(mx)) return mx;
+  if (typeof mx === "string" && mx.trim()) return mx.split(",").map((s) => s.trim()).filter(Boolean);
+  return [];
+};
+
+const normalizeResult = (r = {}) => ({ ...r, mx: toMxArray(r.mx) });
+
+// Server batches have total/validCount/createdAt at the top level and no results.
+// Convert them to the shape the UI renders ({ name, timestamp, summary, results }).
+const normalizeBatch = (b = {}) => {
+  const summary = b.summary || {
+    total: b.total ?? 0,
+    validCount: b.validCount ?? 0,
+    invalidCount: b.invalidCount ?? 0,
+    riskyCount: b.riskyCount ?? 0,
+  };
+  const label = b.source === "manual" ? "Manual Paste" : "Bulk Upload";
+  return {
+    ...b,
+    name: b.name || `${label} #${b.id}`,
+    timestamp: b.timestamp || (b.createdAt ? new Date(b.createdAt).toLocaleString() : ""),
+    summary,
+    // null = not fetched yet; fetched lazily on View / Download
+    results: Array.isArray(b.results) ? b.results.map(normalizeResult) : null,
+  };
+};
+
+const HistoryRow = ({ batch, selected, busy, onView, onDownload, onDelete }) => (
+  <div
+    onClick={onView}
+    className={`p-3 rounded bg-gray-800 flex justify-between items-center cursor-pointer ${selected ? "ring-2 ring-yellow-500" : ""}`}
+  >
+    <div>
+      <div className="font-semibold text-yellow-300">{batch.name}</div>
+      <div className="text-xs text-gray-400">{batch.timestamp}</div>
+      <div className="text-xs text-gray-500">
+        {formatNumber(batch.summary?.total)} emails • {formatNumber(batch.summary?.validCount)} valid •{" "}
+        {formatNumber(batch.summary?.invalidCount)} invalid
+      </div>
+    </div>
+    <div className="flex items-center gap-3">
+      <button
+        type="button"
+        title="View"
+        onClick={(e) => { e.stopPropagation(); onView(); }}
+        className="text-yellow-400 hover:text-yellow-300"
+      >
+        <FaEye />
+      </button>
+      <button
+        type="button"
+        title="Download CSV"
+        disabled={busy}
+        onClick={(e) => { e.stopPropagation(); onDownload(); }}
+        className="text-green-400 hover:text-green-300 disabled:opacity-50"
+      >
+        <HiOutlineDownload />
+      </button>
+      <button
+        type="button"
+        title="Delete"
+        onClick={(e) => { e.stopPropagation(); onDelete(); }}
+        className="text-red-400 hover:text-red-300"
+      >
+        <FaTrash />
+      </button>
+    </div>
+  </div>
+);
+
 const Verification = () => {
   const [activeTab, setActiveTab] = useState("single");
 
@@ -66,40 +140,121 @@ const Verification = () => {
   const [filter, setFilter] = useState("all");
   const [downloadOpen, setDownloadOpen] = useState(false);
 
+  // history actions
+  const [loadingResultsId, setLoadingResultsId] = useState(null);
+  const [pendingDelete, setPendingDelete] = useState(null); // { id, source, name }
+  const [deleting, setDeleting] = useState(false);
+
   // Load history on mount
   useEffect(() => {
-    const token = localStorage.getItem("token");
-
-    const loadBulk = async () => {
+    const loadHistory = async (source, setHistory, setViewingId) => {
       try {
-        const res = await axios.get(`${VRI_URL}/api/verification/batches?source=bulk`, {
-          headers: { Authorization: `Bearer ${token}` },
+        const res = await axios.get(`${VRI_URL}/api/verification/batches?source=${source}`, {
+          headers: authHeaders(),
         });
-        console.log("Bulk batches response:", res.data);
-        setBulkHistory(res.data.batches || []);
-        if ((res.data.batches || []).length > 0) setViewingBulkId(res.data.batches[0].id);
+        const batches = (res.data.batches || []).map(normalizeBatch);
+        setHistory(batches);
+        if (batches.length > 0) setViewingId(batches[0].id);
       } catch (e) {
-        console.warn("Could not fetch bulk history", e?.message || e);
+        console.warn(`Could not fetch ${source} history`, e?.message || e);
       }
     };
 
-    const loadManual = async () => {
-      try {
-        const res = await axios.get(`${VRI_URL}/api/verification/batches?source=manual`, {
-          headers: { Authorization: `Bearer ${token}` },
-        });
-        console.log("Manual batches response:", res.data);
-        setManualHistory(res.data.batches || []);
-        if ((res.data.batches || []).length > 0) setViewingManualId(res.data.batches[0].id);
-      } catch (e) {
-        console.warn("Could not fetch manual history", e?.message || e);
-      }
-    };
-
-
-    loadBulk();
-    loadManual();
+    loadHistory("bulk", setBulkHistory, setViewingBulkId);
+    loadHistory("manual", setManualHistory, setViewingManualId);
   }, []);
+
+  // ---------------- History helpers ----------------
+  const setterFor = (source) => (source === "manual" ? setManualHistory : setBulkHistory);
+
+  // Fetch a batch's results from the server and cache them on the batch in state
+  const fetchBatchResults = async (batchId, source) => {
+    setLoadingResultsId(batchId);
+    try {
+      const res = await axios.get(`${VRI_URL}/api/verification/batches/${batchId}/results`, {
+        headers: authHeaders(),
+      });
+      const results = (res.data.results || []).map(normalizeResult);
+      setterFor(source)((prev) => prev.map((b) => (b.id === batchId ? { ...b, results } : b)));
+      return results;
+    } finally {
+      setLoadingResultsId((cur) => (cur === batchId ? null : cur));
+    }
+  };
+
+  // Whenever the selected batch has no results loaded yet, fetch them
+  useEffect(() => {
+    const b = bulkHistory.find((x) => x.id === viewingBulkId);
+    if (b && b.results === null && loadingResultsId !== b.id) {
+      fetchBatchResults(b.id, "bulk").catch((err) =>
+        console.error("Failed to load bulk results", err?.message || err)
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewingBulkId, bulkHistory]);
+
+  useEffect(() => {
+    const b = manualHistory.find((x) => x.id === viewingManualId);
+    if (b && b.results === null && loadingResultsId !== b.id) {
+      fetchBatchResults(b.id, "manual").catch((err) =>
+        console.error("Failed to load manual results", err?.message || err)
+      );
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [viewingManualId, manualHistory]);
+
+  const handleView = (batch, source) => {
+    setFilter("all");
+    if (source === "manual") setViewingManualId(batch.id);
+    else setViewingBulkId(batch.id);
+  };
+
+  const handleDownload = async (batch, source) => {
+    try {
+      const results = Array.isArray(batch.results)
+        ? batch.results
+        : await fetchBatchResults(batch.id, source);
+      downloadResults(results, "csv", `${source}_${batch.id}`);
+    } catch (err) {
+      console.error("Failed to download results", err?.message || err);
+      alert("Could not download results. Please try again.");
+    }
+  };
+
+  const requestDelete = (batch, source) => {
+    setPendingDelete({ id: batch.id, source, name: batch.name });
+  };
+
+  const cancelDelete = () => {
+    if (!deleting) setPendingDelete(null);
+  };
+
+  const confirmDelete = async () => {
+    if (!pendingDelete) return;
+    const { id, source } = pendingDelete;
+    setDeleting(true);
+    try {
+      await axios.delete(`${VRI_URL}/api/verification/batches/${id}`, { headers: authHeaders() });
+      setterFor(source)((prev) => prev.filter((x) => x.id !== id));
+      if (source === "manual") setViewingManualId((cur) => (cur === id ? null : cur));
+      else setViewingBulkId((cur) => (cur === id ? null : cur));
+      setPendingDelete(null);
+    } catch (err) {
+      console.error("Failed to delete batch", err?.message || err);
+      alert("Could not delete this record: " + (err.response?.data?.error || err.message || "Unknown error"));
+    } finally {
+      setDeleting(false);
+    }
+  };
+
+  // Close the delete popup with Escape
+  useEffect(() => {
+    if (!pendingDelete) return;
+    const onKey = (e) => e.key === "Escape" && cancelDelete();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingDelete, deleting]);
 
   useEffect(() => {
   const fetchCredits = async () => {
@@ -159,72 +314,66 @@ const verifySingle = async () => {
 
 // ---------------- Bulk Upload ----------------
 const handleBulkUpload = async (e) => {
-  const token = localStorage.getItem("token");
-  const file = e.target.files?.[0];
+  const input = e.target;
+  const file = input.files?.[0];
   if (!file) return;
 
   setLoadingBulk(true);
   try {
-    const reader = new FileReader();
-    reader.onload = async (event) => {
-      const emails = event.target.result
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => line)
-        .slice(0, 1000);
+    // await the file read so every error below is caught and the loader stays on until done
+    const text = await file.text();
+    const emails = [
+      ...new Set(
+        (text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi) || []).map((m) => m.trim().toLowerCase())
+      ),
+    ].slice(0, 1000);
 
-      if (emails.length === 0) {
-        alert("No valid emails found in the file.");
-        setLoadingBulk(false);
-        return;
-      }
+    if (emails.length === 0) {
+      alert("No valid emails found in the file.");
+      return;
+    }
 
-      // ✅ Check local credits first
-      const current = parseInt(localStorage.getItem("emailVerificationCredits")) || 0;
-      if (emails.length > current) {
-        alert("Not enough verification credits. Please purchase more credits.");
-        setLoadingBulk(false);
-        return;
-      }
+    // ✅ Check local credits first
+    const current = parseInt(localStorage.getItem("emailVerificationCredits")) || 0;
+    if (emails.length > current) {
+      alert("Not enough verification credits. Please purchase more credits.");
+      return;
+    }
 
-      const res = await axios.post(
-        `${VRI_URL}/api/verification/verify-bulk`,
-        { emails },
-        { headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` } }
-      );
+    const res = await axios.post(
+      `${VRI_URL}/api/verification/verify-bulk`,
+      { emails },
+      { headers: { "Content-Type": "application/json", ...authHeaders() } }
+    );
 
-      const data = res.data;
+    const data = res.data;
 
-      // ✅ Deduct credits locally
-      const newCount = Math.max(current - emails.length, 0);
-      localStorage.setItem("emailVerificationCredits", newCount);
-      window.dispatchEvent(new Event("storage"));
+    // ✅ Deduct credits locally
+    const newCount = Math.max(current - emails.length, 0);
+    localStorage.setItem("emailVerificationCredits", newCount);
+    window.dispatchEvent(new Event("storage"));
 
-      const newBatch = {
-        id: data.batchId,
-        name: `Bulk Upload ${new Date().toLocaleString()}`,
-        timestamp: new Date().toLocaleString(),
-        results: data.results || [],
-        summary: data.summary || {
-          total: emails.length,
-          validCount: 0,
-          invalidCount: 0,
-          riskyCount: 0,
-        },
-      };
+    const newBatch = normalizeBatch({
+      id: data.batchId,
+      source: "bulk",
+      name: `Bulk Upload - ${file.name}`,
+      createdAt: new Date().toISOString(),
+      results: data.results || [],
+      summary: data.summary || { total: emails.length, validCount: 0, invalidCount: 0, riskyCount: 0 },
+    });
 
-      setBulkHistory((prev) => [newBatch, ...prev]);
-      setViewingBulkId(newBatch.id);
-    };
-    reader.readAsText(file);
+    setBulkHistory((prev) => [newBatch, ...prev]);
+    setViewingBulkId(newBatch.id);
+    setFilter("all");
   } catch (err) {
     if (err.response?.status === 403) {
       alert("Verification credits exceeded. Please purchase more credits.");
     } else {
-      alert("Bulk verification failed: " + (err.message || "Unknown"));
+      alert("Bulk verification failed: " + (err.response?.data?.error || err.message || "Unknown"));
     }
   } finally {
     setLoadingBulk(false);
+    input.value = ""; // allow re-uploading the same file
   }
 };
 
@@ -260,15 +409,16 @@ const verifyManual = async () => {
     window.dispatchEvent(new Event("storage"));
 
     // ✅ Add new batch
-    const newBatch = {
-      id: res.data.batchId || Date.now(),
-      name: "Manual Paste",
-      timestamp: new Date().toLocaleString(),
+    const newBatch = normalizeBatch({
+      id: res.data.batchId, // real DB id, so View/Download/Delete work for this batch
+      source: "manual",
+      createdAt: new Date().toISOString(),
       results: res.data.results || [],
       summary: res.data.summary || { total: emails.length },
-    };
+    });
     setManualHistory((p) => [newBatch, ...p]);
     setViewingManualId(newBatch.id);
+    setFilter("all");
     setPasteText("");
   } catch (err) {
     if (err.response?.status === 403) {
@@ -298,7 +448,7 @@ const verifyManual = async () => {
       role_based: r.role_based ? "YES" : "NO",
       free_provider: r.free_provider ? "YES" : "NO",
       provider: r.provider || "-",
-      mx: (r.mx || []).join(", "),
+      mx: toMxArray(r.mx).join(", "),
       reason: r.reason || "-",
       error: r.error || "-",
       quality_score: r.quality_score || 0,
@@ -388,7 +538,7 @@ const verifyManual = async () => {
                     <div className="text-sm text-gray-400 mt-1">
                       Provider: <span className="text-gray-200">{singleResult.provider || "-"}</span>
                       {" • "}
-                      MX: <span className="text-gray-200">{(singleResult.mx || []).join(", ") || "-"}</span>
+                      MX: <span className="text-gray-200">{toMxArray(singleResult.mx).join(", ") || "-"}</span>
                     </div>
                   </div>
                   <div className="flex flex-col items-end gap-2">
@@ -511,7 +661,7 @@ const verifyManual = async () => {
                   </div>
                   <div className="flex items-center gap-3">
                     <button
-                      onClick={() => downloadResults(currentBulk.results || [], "csv", `bulk_${currentBulk.id}`)}
+                      onClick={() => handleDownload(currentBulk, "bulk")}
                       className="px-3 py-1 bg-yellow-500 text-black rounded font-semibold"
                     >
                       Download CSV
@@ -555,27 +705,40 @@ const verifyManual = async () => {
 
                 {/* Results table */}
                 <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
+                  <table className="w-full table-fixed text-sm">
                     <thead className="bg-gray-800">
                       <tr>
-                        <th className="px-3 py-2 text-left">Email</th>
-                        <th className="px-3 py-2">Status</th>
-                        <th className="px-3 py-2">Score</th>
-                        <th className="px-3 py-2">Flags</th>
+                        <th className="w-[40%] px-3 py-2 text-left">Email</th>
+                        <th className="w-[20%] px-3 py-2 text-center">Status</th>
+                        <th className="w-[15%] px-3 py-2 text-center">Score</th>
+                        <th className="w-[25%] px-3 py-2 text-center">Flags</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {filterResults(currentBulk.results || []).map((r) => (
-                        <tr key={r.email} className="border-t border-gray-700 hover:bg-gray-800">
-                          <td className="px-3 py-2">{r.email}</td>
-                          <td className="px-3 py-2"><StatusPill status={r.status} score={r.score ?? 0} /></td>
-                          <td className="px-3 py-2">{r.score ?? 0}%</td>
-                          <td className="px-3 py-2">
-                            <div className="flex gap-2 flex-wrap">
+                      {currentBulk.results === null && (
+                        <tr>
+                          <td colSpan={4} className="px-3 py-4"><LoaderInline text="Loading results..." /></td>
+                        </tr>
+                      )}
+                      {Array.isArray(currentBulk.results) && filterResults(currentBulk.results).length === 0 && (
+                        <tr>
+                          <td colSpan={4} className="px-3 py-4 text-center text-gray-400">No results to show.</td>
+                        </tr>
+                      )}
+                      {filterResults(currentBulk.results || []).map((r, i) => (
+                        <tr key={`${r.email}-${i}`} className="border-t border-gray-700 hover:bg-gray-800">
+                          <td className="px-3 py-2 text-left truncate" title={r.email}>{r.email}</td>
+                          <td className="px-3 py-2 text-center"><StatusPill status={r.status} score={r.score ?? 0} /></td>
+                          <td className="px-3 py-2 text-center">{r.score ?? 0}%</td>
+                          <td className="px-3 py-2 text-center">
+                            <div className="flex gap-2 flex-wrap justify-center">
                               {r.disposable && <span className="px-2 py-0.5 bg-red-600 rounded text-xs">DISP</span>}
                               {r.role_based && <span className="px-2 py-0.5 bg-purple-600 rounded text-xs">ROLE</span>}
                               {r.catch_all && <span className="px-2 py-0.5 bg-yellow-600 rounded text-xs">CATCH</span>}
                               {r.free_provider && <span className="px-2 py-0.5 bg-blue-600 rounded text-xs">FREE</span>}
+                              {!r.disposable && !r.role_based && !r.catch_all && !r.free_provider && (
+                                <span className="text-gray-500">-</span>
+                              )}
                             </div>
                           </td>
                         </tr>
@@ -596,66 +759,15 @@ const verifyManual = async () => {
               ) : (
                 <div className="space-y-3">
                   {bulkHistory.map((b) => (
-                    <div
+                    <HistoryRow
                       key={b.id}
-                      onClick={() => setViewingBulkId(b.id)}
-                      className={`p-3 rounded bg-gray-800 flex justify-between items-center cursor-pointer ${viewingBulkId === b.id ? "ring-2 ring-yellow-500" : ""}`}
-                    >
-                      <div>
-                        <div className="font-semibold text-yellow-300">{b.name || "Batch"}</div>
-                        <div className="text-xs text-gray-400">{b.timestamp}</div>
-                        <div className="text-xs text-gray-500">
-                          {formatNumber(b.total)} emails • {formatNumber(b.validCount)} valid • {formatNumber(b.invalidCount)} invalid
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        {/* View */}
-                        <button
-                          title="View"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            setViewingBulkId(b.id);
-                          }}
-                          className="text-yellow-400"
-                        >
-                          <FaEye />
-                        </button>
-
-                        {/* Download */}
-                        <button
-                          title="Download CSV"
-                          onClick={async (e) => {
-                            e.stopPropagation();
-                            try {
-                              const res = await axios.get(`${VRI_URL}/api/verification/batches/${b.id}/results`, {
-                                headers: { Authorization: `Bearer ${token}` },
-                              });
-                              const results = res.data.results || [];
-                              downloadResults(results, "csv", `bulk_${b.id}`);
-                            } catch (err) {
-                              console.error("Failed to download results", err.message || err);
-                            }
-                          }}
-                          className="text-green-400"
-                        >
-                          <HiOutlineDownload />
-                        </button>
-
-                        {/* Delete */}
-                        <button
-                          title="Delete"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            // Optionally call a DELETE endpoint here too
-                            setBulkHistory((prev) => prev.filter((x) => x.id !== b.id));
-                          }}
-                          className="text-red-400"
-                        >
-                          <FaTrash />
-                        </button>
-                      </div>
-
-                    </div>
+                      batch={b}
+                      selected={viewingBulkId === b.id}
+                      busy={loadingResultsId === b.id}
+                      onView={() => handleView(b, "bulk")}
+                      onDownload={() => handleDownload(b, "bulk")}
+                      onDelete={() => requestDelete(b, "bulk")}
+                    />
                   ))}
                 </div>
               )}
@@ -714,7 +826,7 @@ const verifyManual = async () => {
                   </div>
                   <div>
                     <button
-                      onClick={() => downloadResults(currentManual.results || [], "csv", `manual_${currentManual.id}`)}
+                      onClick={() => handleDownload(currentManual, "manual")}
                       className="px-3 py-1 bg-yellow-500 text-black rounded font-semibold"
                     >
                       Download CSV
@@ -738,27 +850,40 @@ const verifyManual = async () => {
                 </div>
 
                 <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
+                  <table className="w-full table-fixed text-sm">
                     <thead className="bg-gray-800">
                       <tr>
-                        <th className="px-3 py-2 text-left">Email</th>
-                        <th className="px-3 py-2">Status</th>
-                        <th className="px-3 py-2">Score</th>
-                        <th className="px-3 py-2">Flags</th>
+                        <th className="w-[40%] px-3 py-2 text-left">Email</th>
+                        <th className="w-[20%] px-3 py-2 text-center">Status</th>
+                        <th className="w-[15%] px-3 py-2 text-center">Score</th>
+                        <th className="w-[25%] px-3 py-2 text-center">Flags</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {filterResults(currentManual.results || []).map((r) => (
-                        <tr key={r.email} className="border-t border-gray-700 hover:bg-gray-800">
-                          <td className="px-3 py-2">{r.email}</td>
-                          <td className="px-3 py-2"><StatusPill status={r.status} score={r.score ?? 0} /></td>
-                          <td className="px-3 py-2">{r.score ?? 0}%</td>
-                          <td className="px-3 py-2">
-                            <div className="flex gap-2">
+                      {currentManual.results === null && (
+                        <tr>
+                          <td colSpan={4} className="px-3 py-4"><LoaderInline text="Loading results..." /></td>
+                        </tr>
+                      )}
+                      {Array.isArray(currentManual.results) && filterResults(currentManual.results).length === 0 && (
+                        <tr>
+                          <td colSpan={4} className="px-3 py-4 text-center text-gray-400">No results to show.</td>
+                        </tr>
+                      )}
+                      {filterResults(currentManual.results || []).map((r, i) => (
+                        <tr key={`${r.email}-${i}`} className="border-t border-gray-700 hover:bg-gray-800">
+                          <td className="px-3 py-2 text-left truncate" title={r.email}>{r.email}</td>
+                          <td className="px-3 py-2 text-center"><StatusPill status={r.status} score={r.score ?? 0} /></td>
+                          <td className="px-3 py-2 text-center">{r.score ?? 0}%</td>
+                          <td className="px-3 py-2 text-center">
+                            <div className="flex gap-2 flex-wrap justify-center">
                               {r.disposable && <span className="px-2 py-0.5 bg-red-600 rounded text-xs">DISP</span>}
                               {r.role_based && <span className="px-2 py-0.5 bg-purple-600 rounded text-xs">ROLE</span>}
                               {r.catch_all && <span className="px-2 py-0.5 bg-yellow-600 rounded text-xs">CATCH</span>}
                               {r.free_provider && <span className="px-2 py-0.5 bg-blue-600 rounded text-xs">FREE</span>}
+                              {!r.disposable && !r.role_based && !r.catch_all && !r.free_provider && (
+                                <span className="text-gray-500">-</span>
+                              )}
                             </div>
                           </td>
                         </tr>
@@ -777,21 +902,17 @@ const verifyManual = async () => {
               {manualHistory.length === 0 ? (
                 <div className="text-gray-400">No manual history yet.</div>
               ) : (
-                <div className="space-y-2">
+                <div className="space-y-3">
                   {manualHistory.map((m) => (
-                    <div key={m.id} className="p-3 rounded bg-gray-800 flex justify-between items-center">
-                      <div>
-                        <div className="font-semibold text-yellow-300">{m.name}</div>
-                        <div className="text-xs text-gray-400">{m.timestamp}</div>
-                      </div>
-                      <div className="flex gap-2">
-                        <button onClick={() => setViewingManualId(m.id)} className="text-yellow-400"><FaEye /></button>
-                        <button onClick={() => downloadResults(m.results || [], "csv", `manual_${m.id}`)} className="text-green-400">
-                          <HiOutlineDownload />
-                        </button>
-                        <button onClick={() => setManualHistory((p) => p.filter((x) => x.id !== m.id))} className="text-red-400"><FaTrash /></button>
-                      </div>
-                    </div>
+                    <HistoryRow
+                      key={m.id}
+                      batch={m}
+                      selected={viewingManualId === m.id}
+                      busy={loadingResultsId === m.id}
+                      onView={() => handleView(m, "manual")}
+                      onDownload={() => handleDownload(m, "manual")}
+                      onDelete={() => requestDelete(m, "manual")}
+                    />
                   ))}
                 </div>
               )}
@@ -799,6 +920,55 @@ const verifyManual = async () => {
           </div>
         )}
       </div>
+
+      {/* ---------- DELETE CONFIRMATION ---------- */}
+      {pendingDelete && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 px-4"
+          onClick={cancelDelete}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-dialog-title"
+            className="w-full max-w-md rounded-lg border border-gray-700 bg-gray-900 p-6 shadow-xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start gap-3">
+              <HiExclamationCircle className="mt-0.5 h-6 w-6 flex-shrink-0 text-red-400" />
+              <div>
+                <h3 id="delete-dialog-title" className="text-lg font-bold text-gray-100">
+                  Delete record
+                </h3>
+                <p className="mt-2 text-sm text-gray-300">
+                  Are you sure you want to delete this record?
+                </p>
+                {pendingDelete.name && (
+                  <p className="mt-1 text-xs text-gray-500">{pendingDelete.name}</p>
+                )}
+              </div>
+            </div>
+
+            <div className="mt-6 flex justify-end gap-3">
+              <button
+                onClick={cancelDelete}
+                disabled={deleting}
+                autoFocus
+                className="rounded border border-gray-600 px-4 py-2 text-sm font-semibold text-gray-200 hover:bg-gray-800 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDelete}
+                disabled={deleting}
+                className="rounded bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-700 disabled:opacity-60"
+              >
+                {deleting ? "Deleting..." : "Confirm Delete"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </DashboardLayout>
   );
 };
